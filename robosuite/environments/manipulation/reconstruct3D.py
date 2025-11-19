@@ -216,8 +216,6 @@ class Reconstruct3D(ManipulationEnv):
             seed=seed,
         )
 
-        print("Initialized Reconstruct3D Environment")
-
     def reward(self, action):
         from robosuite.utils.log_utils import ROBOSUITE_DEFAULT_LOGGER
 
