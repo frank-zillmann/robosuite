@@ -4,7 +4,7 @@ import numpy as np
 
 from robosuite.environments.manipulation.manipulation_env import ManipulationEnv
 from robosuite.models.arenas import TableArena
-from robosuite.models.objects import BoxObject
+from robosuite.models.objects import BoxObject, CylinderObject
 from robosuite.models.tasks import ManipulationTask
 from robosuite.utils.mjcf_utils import CustomMaterial
 from robosuite.utils.observables import Observable, sensor
@@ -216,6 +216,8 @@ class Reconstruct3D(ManipulationEnv):
             seed=seed,
         )
 
+        print("Initialized Reconstruct3D Environment")
+
     def reward(self, action):
         from robosuite.utils.log_utils import ROBOSUITE_DEFAULT_LOGGER
 
@@ -268,36 +270,64 @@ class Reconstruct3D(ManipulationEnv):
             tex_attrib=tex_attrib,
             mat_attrib=mat_attrib,
         )
-        self.cubeA = BoxObject(
-            name="cubeA",
-            size_min=[0.02, 0.02, 0.02],
-            size_max=[0.02, 0.02, 0.02],
-            rgba=[1, 0, 0, 1],
-            material=redwood,
+
+        self.primitives_on_table = []
+
+        self.primitives_on_table.append(
+            BoxObject(
+                name="Box_red",
+                size_min=[0.05, 0.05, 0.05],
+                size_max=[0.2, 0.2, 0.2],
+                rgba=[1, 0, 0, 1],
+                material=redwood,
+            )
         )
-        self.cubeB = BoxObject(
-            name="cubeB",
-            size_min=[0.025, 0.025, 0.025],
-            size_max=[0.025, 0.025, 0.025],
-            rgba=[0, 1, 0, 1],
-            material=greenwood,
+
+        self.primitives_on_table.append(
+            BoxObject(
+                name="Box_green",
+                size_min=[0.05, 0.05, 0.05],
+                size_max=[0.2, 0.2, 0.2],
+                rgba=[0, 1, 0, 1],
+                material=greenwood,
+            )
         )
-        cubes = [self.cubeA, self.cubeB]
+
+        self.primitives_on_table.append(
+            CylinderObject(
+                name="Cylinder_red",
+                size_min=[0.05, 0.05],
+                size_max=[0.2, 0.2],
+                rgba=[0, 0, 1, 1],
+                material=redwood,
+            )
+        )
+
+        self.primitives_on_table.append(
+            CylinderObject(
+                name="Cylinder_green",
+                size_min=[0.05, 0.05],
+                size_max=[0.2, 0.2],
+                rgba=[0, 0, 1, 1],
+                material=greenwood,
+            )
+        )
+
         # Create placement initializer
         if self.placement_initializer is not None:
             self.placement_initializer.reset()
-            self.placement_initializer.add_objects(cubes)
+            self.placement_initializer.add_objects(self.primitives_on_table)
         else:
             self.placement_initializer = UniformRandomSampler(
                 name="ObjectSampler",
-                mujoco_objects=cubes,
-                x_range=[-0.08, 0.08],
-                y_range=[-0.08, 0.08],
-                rotation=None,
+                mujoco_objects=self.primitives_on_table,
+                x_range=[self.table_full_size[0] * -0.4, self.table_full_size[0] * 0.4],
+                y_range=[self.table_full_size[1] * -0.4, self.table_full_size[1] * 0.4],
+                rotation=None,  # uniform random rotation
                 ensure_object_boundary_in_range=False,
                 ensure_valid_placement=True,
                 reference_pos=self.table_offset,
-                z_offset=0.01,
+                z_offset=0.00,  # place on table surface
                 rng=self.rng,
             )
 
@@ -305,7 +335,7 @@ class Reconstruct3D(ManipulationEnv):
         self.model = ManipulationTask(
             mujoco_arena=mujoco_arena,
             mujoco_robots=[robot.robot_model for robot in self.robots],
-            mujoco_objects=cubes,
+            mujoco_objects=self.primitives_on_table,
         )
 
     def _setup_references(self):
@@ -316,9 +346,7 @@ class Reconstruct3D(ManipulationEnv):
         """
         super()._setup_references()
 
-        # Additional object references from this env
-        self.cubeA_body_id = self.sim.model.body_name2id(self.cubeA.root_body)
-        self.cubeB_body_id = self.sim.model.body_name2id(self.cubeB.root_body)
+        self.primitives_on_table_ids = [self.sim.model.body_name2id(obj.root_body) for obj in self.primitives_on_table]
 
     def _reset_internal(self):
         """
@@ -345,54 +373,7 @@ class Reconstruct3D(ManipulationEnv):
         """
         observables = super()._setup_observables()
 
-        # low-level object information
-        if self.use_object_obs:
-            # define observables modality
-            modality = "object"
-
-            # position and rotation of the first cube
-            @sensor(modality=modality)
-            def cubeA_pos(obs_cache):
-                return np.array(self.sim.data.body_xpos[self.cubeA_body_id])
-
-            @sensor(modality=modality)
-            def cubeA_quat(obs_cache):
-                return convert_quat(np.array(self.sim.data.body_xquat[self.cubeA_body_id]), to="xyzw")
-
-            @sensor(modality=modality)
-            def cubeB_pos(obs_cache):
-                return np.array(self.sim.data.body_xpos[self.cubeB_body_id])
-
-            @sensor(modality=modality)
-            def cubeB_quat(obs_cache):
-                return convert_quat(np.array(self.sim.data.body_xquat[self.cubeB_body_id]), to="xyzw")
-
-            @sensor(modality=modality)
-            def cubeA_to_cubeB(obs_cache):
-                return (
-                    obs_cache["cubeB_pos"] - obs_cache["cubeA_pos"]
-                    if "cubeA_pos" in obs_cache and "cubeB_pos" in obs_cache
-                    else np.zeros(3)
-                )
-
-            arm_prefixes = self._get_arm_prefixes(self.robots[0], include_robot_name=False)
-            full_prefixes = self._get_arm_prefixes(self.robots[0])
-
-            sensors = [cubeA_pos, cubeA_quat, cubeB_pos, cubeB_quat, cubeA_to_cubeB]
-            sensors += [
-                self._get_obj_eef_sensor(full_pf, f"{cube}_pos", f"{arm_pf}gripper_to_{cube}", modality)
-                for arm_pf, full_pf in zip(arm_prefixes, full_prefixes)
-                for cube in ["cubeA", "cubeB"]
-            ]
-            names = [s.__name__ for s in sensors]
-
-            # Create observables
-            for name, s in zip(names, sensors):
-                observables[name] = Observable(
-                    name=name,
-                    sensor=s,
-                    sampling_rate=self.control_freq,
-                )
+        # No extra observables for now
 
         return observables
 
