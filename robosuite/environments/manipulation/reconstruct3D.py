@@ -383,3 +383,160 @@ class Reconstruct3D(ManipulationEnv):
             bool: False (so far no success condition is defined)
         """
         return False
+
+    def get_static_env_mesh(self):
+        """
+        Extract static environment mesh (table + objects) from MuJoCo simulation.
+
+        Returns:
+            tuple: (vertices, faces) where:
+                - vertices: (N, 3) array of vertex positions
+                - faces: (M, 3) array of triangle face indices
+        """
+        import mujoco
+
+        all_vertices = []
+        all_faces = []
+        vertex_offset = 0
+
+        # Get body names for objects we want to include
+        object_body_names = set()
+        for obj in self.primitives_on_table:
+            object_body_names.add(obj.root_body)
+
+        # Add table body (note: body name is "table", not "table_collision")
+        object_body_names.add("table")
+
+        # Iterate over all geoms to find table and objects
+        for geom_id in range(self.sim.model.ngeom):
+            geom_type = self.sim.model.geom_type[geom_id]
+            body_id = self.sim.model.geom_bodyid[geom_id]
+            body_name = self.sim.model.body(body_id).name
+
+            # Only include table and objects
+            if body_name not in object_body_names:
+                continue
+
+            # Get geom pose
+            geom_pos = self.sim.data.geom_xpos[geom_id]
+            geom_mat = self.sim.data.geom_xmat[geom_id].reshape(3, 3)
+
+            # Handle meshes
+            if geom_type == mujoco.mjtGeom.mjGEOM_MESH:
+                mesh_id = self.sim.model.geom_dataid[geom_id]
+
+                # Extract mesh vertices
+                vert_start = self.sim.model.mesh_vertadr[mesh_id]
+                vert_end = (
+                    self.sim.model.mesh_vertadr[mesh_id + 1]
+                    if mesh_id < self.sim.model.nmesh - 1
+                    else self.sim.model.mesh_vert.shape[0]
+                )
+                vertices = self.sim.model.mesh_vert[vert_start:vert_end].copy()
+
+                # Extract mesh faces
+                face_start = self.sim.model.mesh_faceadr[mesh_id]
+                face_end = (
+                    self.sim.model.mesh_faceadr[mesh_id + 1]
+                    if mesh_id < self.sim.model.nmesh - 1
+                    else self.sim.model.mesh_face.shape[0]
+                )
+                faces = self.sim.model.mesh_face[face_start:face_end].copy()
+
+            else:
+                # Generate mesh for primitive shapes
+                vertices, faces = self._generate_primitive_mesh(geom_type, geom_id)
+
+            # Transform vertices to world coordinates
+            vertices = vertices @ geom_mat.T + geom_pos
+
+            # Add to combined mesh
+            all_vertices.append(vertices)
+            all_faces.append(faces + vertex_offset)
+            vertex_offset += len(vertices)
+
+        # Combine all meshes
+        combined_vertices = np.vstack(all_vertices) if all_vertices else np.zeros((0, 3))
+        combined_faces = np.vstack(all_faces) if all_faces else np.zeros((0, 3), dtype=np.int32)
+
+        return combined_vertices, combined_faces
+
+    def _generate_primitive_mesh(self, geom_type, geom_id):
+        """Generate mesh for primitive shapes (box, cylinder, etc.)."""
+        import mujoco
+
+        geom_size = self.sim.model.geom_size[geom_id]
+
+        if geom_type == mujoco.mjtGeom.mjGEOM_BOX:
+            # Box: 8 vertices, 12 triangles
+            sx, sy, sz = geom_size
+            vertices = np.array(
+                [
+                    [-sx, -sy, -sz],
+                    [sx, -sy, -sz],
+                    [sx, sy, -sz],
+                    [-sx, sy, -sz],
+                    [-sx, -sy, sz],
+                    [sx, -sy, sz],
+                    [sx, sy, sz],
+                    [-sx, sy, sz],
+                ]
+            )
+            faces = np.array(
+                [
+                    [0, 1, 2],
+                    [0, 2, 3],
+                    [4, 5, 6],
+                    [4, 6, 7],  # bottom, top
+                    [0, 1, 5],
+                    [0, 5, 4],
+                    [2, 3, 7],
+                    [2, 7, 6],  # front, back
+                    [0, 3, 7],
+                    [0, 7, 4],
+                    [1, 2, 6],
+                    [1, 6, 5],  # left, right
+                ]
+            )
+
+        elif geom_type == mujoco.mjtGeom.mjGEOM_CYLINDER:
+            # Cylinder: approximate with triangular mesh
+            radius, half_height = geom_size[0], geom_size[1]
+            n_segments = 16
+            vertices = []
+            faces = []
+
+            # Generate vertices
+            for i in range(n_segments):
+                angle = 2 * np.pi * i / n_segments
+                x, y = radius * np.cos(angle), radius * np.sin(angle)
+                vertices.append([x, y, -half_height])
+                vertices.append([x, y, half_height])
+
+            # Add center vertices for caps
+            vertices.append([0, 0, -half_height])
+            vertices.append([0, 0, half_height])
+
+            vertices = np.array(vertices)
+
+            # Generate faces
+            for i in range(n_segments):
+                i1, i2 = 2 * i, 2 * ((i + 1) % n_segments)
+                # Side faces
+                faces.append([i1, i2, i1 + 1])
+                faces.append([i1 + 1, i2, i2 + 1])
+                # Bottom cap
+                faces.append([2 * n_segments, i1, i2])
+                # Top cap
+                faces.append([2 * n_segments + 1, i2 + 1, i1 + 1])
+
+            faces = np.array(faces)
+
+        else:
+            # Fallback for unsupported types
+            vertices = np.zeros((0, 3))
+            faces = np.zeros((0, 3), dtype=np.int32)
+            print(f"Warning: Unsupported geom type {geom_type} for mesh extraction.")
+            raise NotImplementedError(f"Unsupported geom type {geom_type} for mesh extraction.")
+
+        return vertices, faces
