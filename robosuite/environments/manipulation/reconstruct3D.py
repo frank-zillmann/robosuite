@@ -384,7 +384,7 @@ class Reconstruct3D(ManipulationEnv):
         """
         return False
 
-    def get_static_env_mesh(self):
+    def get_static_env_mesh(self, geom_groups=None):
         """
         Extract static environment mesh (table + objects) from MuJoCo simulation.
 
@@ -407,6 +407,10 @@ class Reconstruct3D(ManipulationEnv):
         # Add table body (note: body name is "table", not "table_collision")
         object_body_names.add("table")
 
+        # Normalize geom_groups input
+        if geom_groups is not None:
+            geom_groups = set(geom_groups)
+
         # Iterate over all geoms to find table and objects
         for geom_id in range(self.sim.model.ngeom):
             geom_type = self.sim.model.geom_type[geom_id]
@@ -416,6 +420,12 @@ class Reconstruct3D(ManipulationEnv):
             # Only include table and objects
             if body_name not in object_body_names:
                 continue
+
+            # If geom_groups filter provided, enforce it
+            if geom_groups is not None:
+                geom_group = self.sim.model.geom_group[geom_id]
+                if geom_group not in geom_groups:
+                    continue
 
             # Get geom pose
             geom_pos = self.sim.data.geom_xpos[geom_id]
