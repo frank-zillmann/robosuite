@@ -139,6 +139,16 @@ class Reconstruct3D(ManipulationEnv):
             [multiple / a single] segmentation(s) to use for all cameras. A list of list of str specifies per-camera
             segmentation setting(s) to use.
 
+        sdf_size (int): Resolution of the SDF grid (default 32). The SDF will be computed on a cubic grid
+            of shape (sdf_size, sdf_size, sdf_size).
+
+        sdf_padding (float): Padding ratio for the SDF bounding box (default 0.05 = 5% padding on each side).
+            This ensures surfaces at boundaries are not cut off.
+
+        reward_scale (float): Scales the normalized reward function by the amount specified. reward_scale = maximum possible reward.
+
+        characteristic_error (float): Characteristic error value used for normalizing the reward function: reward_scale * exp(-error/characteristic_error)
+
     Raises:
         AssertionError: [Invalid number of robots specified]
     """
@@ -175,6 +185,11 @@ class Reconstruct3D(ManipulationEnv):
         renderer="mjviewer",
         renderer_config=None,
         seed=None,
+        # SDF-related parameters
+        sdf_size=32,
+        sdf_padding=0.05,
+        reward_scale=1.0,
+        characteristic_error=0.05,
     ):
         # settings for table top
         self.table_full_size = table_full_size
@@ -186,6 +201,17 @@ class Reconstruct3D(ManipulationEnv):
 
         # object placement initializer
         self.placement_initializer = placement_initializer
+
+        # SDF-related object variables (initialized to None, computed via compute_static_env_sdf)
+        self.sdf_grid = None
+        self.sdf_bbox_center = None
+        self.sdf_bbox_size = None
+        self.sdf_size = sdf_size
+        self.sdf_padding = sdf_padding
+
+        # Reward scaling
+        self.reward_scale = reward_scale
+        self.characteristic_error = characteristic_error
 
         super().__init__(
             robots=robots,
@@ -216,14 +242,168 @@ class Reconstruct3D(ManipulationEnv):
             seed=seed,
         )
 
-    def reward(self, action):
-        from robosuite.utils.log_utils import ROBOSUITE_DEFAULT_LOGGER
+    def reward(self, action=None, input_sdf=None, bbox_min=None, bbox_max=None):
+        """
+        Reward function for the 3D reconstruction task.
 
-        ROBOSUITE_DEFAULT_LOGGER.warning(
-            "Reward function for Reconstruct3D environment is not implemented yet. Returning 0."
-        )
+        The reward is based on the negative squared error between the input SDF (from reconstruction)
+        and the ground truth SDF. Lower reconstruction error yields higher reward.
 
-        return 0
+        Note that the final reward is normalized and scaled by reward_scale so that the max score
+        is equal to reward_scale (when error is 0).
+
+        Args:
+            action (np array): [NOT USED] Robot action for compatibility with robosuite API
+            input_sdf (np.ndarray): Input SDF grid from reconstruction to compare against ground truth.
+                If None, returns 0 with a warning.
+            bbox_min (np.ndarray, optional): Minimum corner of bounding box in global coordinates
+                for selective error computation. Shape (3,).
+            bbox_max (np.ndarray, optional): Maximum corner of bounding box in global coordinates
+                for selective error computation. Shape (3,).
+
+        Returns:
+            float: reward value (higher is better, max is reward_scale when error is 0)
+        """
+        if input_sdf is None:
+            from robosuite.utils.log_utils import ROBOSUITE_DEFAULT_LOGGER
+
+            ROBOSUITE_DEFAULT_LOGGER.warning("No input_sdf provided to reward function. Returning 0.")
+            return 0.0
+
+        error = self.compute_sdf_error(input_sdf, bbox_min=bbox_min, bbox_max=bbox_max)
+
+        # Convert error to reward: reward = reward_scale * exp(-error/characteristic_error)
+        reward = self.reward_scale * np.exp(-error / self.characteristic_error)
+
+        return reward
+
+    def compute_static_env_sdf(self, geom_groups=None):
+        """
+        Compute SDF from the static environment mesh and store in object variables.
+
+        This method extracts the mesh from the environment (table + objects), normalizes it,
+        computes the SDF using mesh2sdf, and stores the result along with bounding box
+        information for later use.
+
+        Args:
+            geom_groups (list of int, optional): Geom groups to include in mesh extraction.
+                Use [0] for collision geoms only to avoid duplicates.
+
+        Returns:
+            np.ndarray: The computed SDF grid of shape (sdf_size, sdf_size, sdf_size)
+        """
+        import mesh2sdf
+
+        # Extract static environment mesh
+        if geom_groups is None:
+            geom_groups = [0]  # Default to collision geoms only
+
+        vertices, faces = self.get_static_env_mesh(geom_groups=geom_groups)
+
+        # Compute bounding box
+        bbox_min = vertices.min(axis=0)
+        bbox_max = vertices.max(axis=0)
+        bbox_center = (bbox_min + bbox_max) / 2
+        bbox_size = (bbox_max - bbox_min).max()
+
+        # Add padding to bounding box to avoid cutting off surfaces at boundaries
+        bbox_size = bbox_size * (1 + 2 * self.sdf_padding)
+
+        # Normalize vertices to [-1, 1] for mesh2sdf
+        vertices_normalized = (vertices - bbox_center) / (bbox_size / 2)
+
+        # Convert to SDF using mesh2sdf
+        sdf_grid = mesh2sdf.compute(vertices_normalized, faces, size=self.sdf_size, fix=False, return_mesh=False)
+
+        # Store results in object variables
+        self.sdf_grid = sdf_grid
+        self.sdf_bbox_center = bbox_center
+        self.sdf_bbox_size = bbox_size
+
+        return
+
+    def compute_sdf_error(self, input_sdf, bbox_min=None, bbox_max=None):
+        """
+        Compute the squared componentwise error between an input SDF and the stored ground truth SDF.
+
+        Args:
+            input_sdf (np.ndarray): Input SDF grid to compare against ground truth.
+                Must have the same shape as self.sdf_grid.
+            bbox_min (np.ndarray, optional): Minimum corner of bounding box in global coordinates
+                for selective error computation. Shape (3,). If None, uses entire grid.
+            bbox_max (np.ndarray, optional): Maximum corner of bounding box in global coordinates
+                for selective error computation. Shape (3,). If None, uses entire grid.
+
+        Returns:
+            float: Mean squared error between input SDF and ground truth SDF (within bounding box if specified)
+
+        Raises:
+            RuntimeError: If compute_static_env_sdf has not been called yet
+            ValueError: If input_sdf shape does not match ground truth SDF shape
+        """
+        # Check if SDF has been computed
+        if self.sdf_grid is None:
+            raise RuntimeError("Ground truth SDF has not been computed yet. " "Call compute_static_env_sdf() first.")
+
+        # Check shape match
+        if input_sdf.shape != self.sdf_grid.shape:
+            raise ValueError(
+                f"Input SDF shape {input_sdf.shape} does not match " f"ground truth SDF shape {self.sdf_grid.shape}"
+            )
+
+        # If no bounding box specified, compute error over entire grid
+        if bbox_min is None or bbox_max is None:
+            sdf_should = self.sdf_grid
+            sdf_is = input_sdf
+
+        else:
+
+            # Convert bounding box from global coordinates to grid indices
+            bbox_min = np.asarray(bbox_min)
+            bbox_max = np.asarray(bbox_max)
+
+            # Transform global coordinates to normalized coordinates [-1, 1]
+            normalized_min = (bbox_min - self.sdf_bbox_center) / (self.sdf_bbox_size / 2)
+            normalized_max = (bbox_max - self.sdf_bbox_center) / (self.sdf_bbox_size / 2)
+
+            # Transform normalized coordinates to grid indices [0, sdf_size-1]
+            grid_min = ((normalized_min + 1) / 2 * self.sdf_size).astype(int)
+            grid_max = ((normalized_max + 1) / 2 * self.sdf_size).astype(int)
+
+            if (grid_min >= grid_max).any():
+                raise ValueError(
+                    f"Invalid bounding box specified: min corner index is not less than max corner index. "
+                    f"grid_min: {grid_min}, grid_max: {grid_max}"
+                )
+
+            # Clip to valid grid range
+            if (
+                (grid_min < 0).any()
+                or (grid_min >= self.sdf_size).any()
+                or (grid_max < 0).any()
+                or (grid_max >= self.sdf_size).any()
+            ):
+                from robosuite.utils.log_utils import ROBOSUITE_DEFAULT_LOGGER
+
+                ROBOSUITE_DEFAULT_LOGGER.warning(
+                    f"Bounding box indices out of grid range. Clipping to valid range."
+                    f" grid_min: {grid_min}, grid_max: {grid_max}"
+                )
+
+            grid_min = np.clip(grid_min, 0, self.sdf_size - 1)
+            grid_max = np.clip(grid_max, 0, self.sdf_size - 1)
+
+            # Extract subgrids within bounding box
+            sdf_is = input_sdf[
+                grid_min[0] : grid_max[0] + 1, grid_min[1] : grid_max[1] + 1, grid_min[2] : grid_max[2] + 1
+            ]
+            sdf_should = self.sdf_grid[
+                grid_min[0] : grid_max[0] + 1, grid_min[1] : grid_max[1] + 1, grid_min[2] : grid_max[2] + 1
+            ]
+
+        diff = sdf_is - sdf_should
+        mse = np.mean(diff**2)
+        return mse
 
     def _load_model(self):
         """
