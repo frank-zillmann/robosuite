@@ -202,6 +202,10 @@ class Reconstruct3D(ManipulationEnv):
         # object placement initializer
         self.placement_initializer = placement_initializer
 
+        # static env mesh related variables (initialized to None, computed via compute_static_env_mesh)
+        self.combined_vertices = None
+        self.combined_faces = None
+
         # SDF-related object variables (initialized to None, computed via compute_static_env_sdf)
         self.sdf_grid = None
         self.sdf_bbox_center = None
@@ -242,7 +246,7 @@ class Reconstruct3D(ManipulationEnv):
             seed=seed,
         )
 
-    def reward(self, action=None, input_sdf=None, bbox_min=None, bbox_max=None):
+    def reward(self, action=None, reconstruction=None, bbox_min=None, bbox_max=None):
         """
         Reward function for the 3D reconstruction task.
 
@@ -264,65 +268,30 @@ class Reconstruct3D(ManipulationEnv):
         Returns:
             float: reward value (higher is better, max is reward_scale when error is 0)
         """
-        if input_sdf is None:
+        if reconstruction is None:
             from robosuite.utils.log_utils import ROBOSUITE_DEFAULT_LOGGER
 
-            ROBOSUITE_DEFAULT_LOGGER.warning("No input_sdf provided to reward function. Returning 0.")
-            return 0.0
+            ROBOSUITE_DEFAULT_LOGGER.warning(
+                "No reconstruction provided. Returning None reward. Expected during automatic call during step but not when called directly."
+            )
 
-        error = self.compute_sdf_error(input_sdf, bbox_min=bbox_min, bbox_max=bbox_max)
+            return None
 
-        # Convert error to reward: reward = reward_scale * exp(-error/characteristic_error)
-        reward = self.reward_scale * np.exp(-error / self.characteristic_error)
+        if reconstruction.shape == self.sdf_grid.shape:
+
+            error = self.compute_elementwise_sdf_error(reconstruction, bbox_min=bbox_min, bbox_max=bbox_max)
+
+            # Convert error to reward: reward = reward_scale * exp(-error/characteristic_error)
+            reward = self.reward_scale * np.exp(-error / self.characteristic_error)
+
+        else:
+            raise ValueError(
+                f"Input reconstruction shape does not match any expected reconstruction format. Type: {type(reconstruction)}, shape: {reconstruction.shape}"
+            )
 
         return reward
 
-    def compute_static_env_sdf(self, geom_groups=None):
-        """
-        Compute SDF from the static environment mesh and store in object variables.
-
-        This method extracts the mesh from the environment (table + objects), normalizes it,
-        computes the SDF using mesh2sdf, and stores the result along with bounding box
-        information for later use.
-
-        Args:
-            geom_groups (list of int, optional): Geom groups to include in mesh extraction.
-                Use [0] for collision geoms only to avoid duplicates.
-
-        Returns:
-            np.ndarray: The computed SDF grid of shape (sdf_size, sdf_size, sdf_size)
-        """
-        import mesh2sdf
-
-        # Extract static environment mesh
-        if geom_groups is None:
-            geom_groups = [0]  # Default to collision geoms only
-
-        vertices, faces = self.get_static_env_mesh(geom_groups=geom_groups)
-
-        # Compute bounding box
-        bbox_min = vertices.min(axis=0)
-        bbox_max = vertices.max(axis=0)
-        bbox_center = (bbox_min + bbox_max) / 2
-        bbox_size = (bbox_max - bbox_min).max()
-
-        # Add padding to bounding box to avoid cutting off surfaces at boundaries
-        bbox_size = bbox_size * (1 + 2 * self.sdf_padding)
-
-        # Normalize vertices to [-1, 1] for mesh2sdf
-        vertices_normalized = (vertices - bbox_center) / (bbox_size / 2)
-
-        # Convert to SDF using mesh2sdf
-        sdf_grid = mesh2sdf.compute(vertices_normalized, faces, size=self.sdf_size, fix=False, return_mesh=False)
-
-        # Store results in object variables
-        self.sdf_grid = sdf_grid
-        self.sdf_bbox_center = bbox_center
-        self.sdf_bbox_size = bbox_size
-
-        return
-
-    def compute_sdf_error(self, input_sdf, bbox_min=None, bbox_max=None):
+    def compute_elementwise_sdf_error(self, input_sdf, bbox_min=None, bbox_max=None, power=2):
         """
         Compute the squared componentwise error between an input SDF and the stored ground truth SDF.
 
@@ -333,6 +302,7 @@ class Reconstruct3D(ManipulationEnv):
                 for selective error computation. Shape (3,). If None, uses entire grid.
             bbox_max (np.ndarray, optional): Maximum corner of bounding box in global coordinates
                 for selective error computation. Shape (3,). If None, uses entire grid.
+            power (float): Power to raise absolute difference to when computing error. Default is 2 (squared error).
 
         Returns:
             float: Mean squared error between input SDF and ground truth SDF (within bounding box if specified)
@@ -401,9 +371,143 @@ class Reconstruct3D(ManipulationEnv):
                 grid_min[0] : grid_max[0] + 1, grid_min[1] : grid_max[1] + 1, grid_min[2] : grid_max[2] + 1
             ]
 
-        diff = sdf_is - sdf_should
-        mse = np.mean(diff**2)
+        abs_diff = np.abs(sdf_is - sdf_should)
+        mse = np.mean(abs_diff**power)
         return mse
+
+    def compute_static_env_sdf(self, geom_groups=None):
+        """
+        Compute SDF from the static environment mesh and store in object variables.
+
+        This method extracts the mesh from the environment (table + objects), normalizes it,
+        computes the SDF using mesh2sdf, and stores the result along with bounding box
+        information for later use.
+
+        Args:
+            geom_groups (list of int, optional): Geom groups to include in mesh extraction.
+                Use [0] for collision geoms only to avoid duplicates.
+
+        Returns:
+            np.ndarray: The computed SDF grid of shape (sdf_size, sdf_size, sdf_size)
+            np.ndarray: The center of the SDF bounding box in global coordinates (shape (3,))
+            float: The size of the SDF bounding box (length of the longest side)
+        """
+        import mesh2sdf
+
+        # Extract static environment mesh
+        if geom_groups is None:
+            geom_groups = [0]  # Default to collision geoms only
+
+        vertices, faces = self.compute_static_env_mesh(geom_groups=geom_groups)
+
+        # Compute bounding box
+        bbox_min = vertices.min(axis=0)
+        bbox_max = vertices.max(axis=0)
+        bbox_center = (bbox_min + bbox_max) / 2
+        bbox_size = (bbox_max - bbox_min).max()
+
+        # Add padding to bounding box to avoid cutting off surfaces at boundaries
+        bbox_size = bbox_size * (1 + 2 * self.sdf_padding)
+
+        # Normalize vertices to [-1, 1] for mesh2sdf
+        vertices_normalized = (vertices - bbox_center) / (bbox_size / 2)
+
+        # Convert to SDF using mesh2sdf
+        sdf_grid = mesh2sdf.compute(vertices_normalized, faces, size=self.sdf_size, fix=False, return_mesh=False)
+
+        # Store results in object variables
+        self.sdf_grid = sdf_grid
+        self.sdf_bbox_center = bbox_center
+        self.sdf_bbox_size = bbox_size
+
+        return self.sdf_grid, self.sdf_bbox_center, self.sdf_bbox_size
+
+    def compute_static_env_mesh(self, geom_groups=None):
+        """
+        Extract static environment mesh (table + objects) from MuJoCo simulation.
+
+        Returns:
+            tuple: (vertices, faces) where:
+                - vertices: (N, 3) array of vertex positions
+                - faces: (M, 3) array of triangle face indices
+        """
+        import mujoco
+
+        all_vertices = []
+        all_faces = []
+        vertex_offset = 0
+
+        # Get body names for objects we want to include
+        object_body_names = set()
+        for obj in self.primitives_on_table:
+            object_body_names.add(obj.root_body)
+
+        # Add table body (note: body name is "table", not "table_collision")
+        object_body_names.add("table")
+
+        # Normalize geom_groups input
+        if geom_groups is not None:
+            geom_groups = set(geom_groups)
+
+        # Iterate over all geoms to find table and objects
+        for geom_id in range(self.sim.model.ngeom):
+            geom_type = self.sim.model.geom_type[geom_id]
+            body_id = self.sim.model.geom_bodyid[geom_id]
+            body_name = self.sim.model.body(body_id).name
+
+            # Only include table and objects
+            if body_name not in object_body_names:
+                continue
+
+            # If geom_groups filter provided, enforce it
+            if geom_groups is not None:
+                geom_group = self.sim.model.geom_group[geom_id]
+                if geom_group not in geom_groups:
+                    continue
+
+            # Get geom pose
+            geom_pos = self.sim.data.geom_xpos[geom_id]
+            geom_mat = self.sim.data.geom_xmat[geom_id].reshape(3, 3)
+
+            # Handle meshes
+            if geom_type == mujoco.mjtGeom.mjGEOM_MESH:
+                mesh_id = self.sim.model.geom_dataid[geom_id]
+
+                # Extract mesh vertices
+                vert_start = self.sim.model.mesh_vertadr[mesh_id]
+                vert_end = (
+                    self.sim.model.mesh_vertadr[mesh_id + 1]
+                    if mesh_id < self.sim.model.nmesh - 1
+                    else self.sim.model.mesh_vert.shape[0]
+                )
+                vertices = self.sim.model.mesh_vert[vert_start:vert_end].copy()
+
+                # Extract mesh faces
+                face_start = self.sim.model.mesh_faceadr[mesh_id]
+                face_end = (
+                    self.sim.model.mesh_faceadr[mesh_id + 1]
+                    if mesh_id < self.sim.model.nmesh - 1
+                    else self.sim.model.mesh_face.shape[0]
+                )
+                faces = self.sim.model.mesh_face[face_start:face_end].copy()
+
+            else:
+                # Generate mesh for primitive shapes
+                vertices, faces = self._generate_primitive_mesh(geom_type, geom_id)
+
+            # Transform vertices to world coordinates
+            vertices = vertices @ geom_mat.T + geom_pos
+
+            # Add to combined mesh
+            all_vertices.append(vertices)
+            all_faces.append(faces + vertex_offset)
+            vertex_offset += len(vertices)
+
+        # Combine all meshes
+        self.combined_vertices = np.vstack(all_vertices) if all_vertices else np.zeros((0, 3))
+        self.combined_faces = np.vstack(all_faces) if all_faces else np.zeros((0, 3), dtype=np.int32)
+
+        return self.combined_vertices, self.combined_faces
 
     def _load_model(self):
         """
@@ -564,93 +668,6 @@ class Reconstruct3D(ManipulationEnv):
         """
         return False
 
-    def get_static_env_mesh(self, geom_groups=None):
-        """
-        Extract static environment mesh (table + objects) from MuJoCo simulation.
-
-        Returns:
-            tuple: (vertices, faces) where:
-                - vertices: (N, 3) array of vertex positions
-                - faces: (M, 3) array of triangle face indices
-        """
-        import mujoco
-
-        all_vertices = []
-        all_faces = []
-        vertex_offset = 0
-
-        # Get body names for objects we want to include
-        object_body_names = set()
-        for obj in self.primitives_on_table:
-            object_body_names.add(obj.root_body)
-
-        # Add table body (note: body name is "table", not "table_collision")
-        object_body_names.add("table")
-
-        # Normalize geom_groups input
-        if geom_groups is not None:
-            geom_groups = set(geom_groups)
-
-        # Iterate over all geoms to find table and objects
-        for geom_id in range(self.sim.model.ngeom):
-            geom_type = self.sim.model.geom_type[geom_id]
-            body_id = self.sim.model.geom_bodyid[geom_id]
-            body_name = self.sim.model.body(body_id).name
-
-            # Only include table and objects
-            if body_name not in object_body_names:
-                continue
-
-            # If geom_groups filter provided, enforce it
-            if geom_groups is not None:
-                geom_group = self.sim.model.geom_group[geom_id]
-                if geom_group not in geom_groups:
-                    continue
-
-            # Get geom pose
-            geom_pos = self.sim.data.geom_xpos[geom_id]
-            geom_mat = self.sim.data.geom_xmat[geom_id].reshape(3, 3)
-
-            # Handle meshes
-            if geom_type == mujoco.mjtGeom.mjGEOM_MESH:
-                mesh_id = self.sim.model.geom_dataid[geom_id]
-
-                # Extract mesh vertices
-                vert_start = self.sim.model.mesh_vertadr[mesh_id]
-                vert_end = (
-                    self.sim.model.mesh_vertadr[mesh_id + 1]
-                    if mesh_id < self.sim.model.nmesh - 1
-                    else self.sim.model.mesh_vert.shape[0]
-                )
-                vertices = self.sim.model.mesh_vert[vert_start:vert_end].copy()
-
-                # Extract mesh faces
-                face_start = self.sim.model.mesh_faceadr[mesh_id]
-                face_end = (
-                    self.sim.model.mesh_faceadr[mesh_id + 1]
-                    if mesh_id < self.sim.model.nmesh - 1
-                    else self.sim.model.mesh_face.shape[0]
-                )
-                faces = self.sim.model.mesh_face[face_start:face_end].copy()
-
-            else:
-                # Generate mesh for primitive shapes
-                vertices, faces = self._generate_primitive_mesh(geom_type, geom_id)
-
-            # Transform vertices to world coordinates
-            vertices = vertices @ geom_mat.T + geom_pos
-
-            # Add to combined mesh
-            all_vertices.append(vertices)
-            all_faces.append(faces + vertex_offset)
-            vertex_offset += len(vertices)
-
-        # Combine all meshes
-        combined_vertices = np.vstack(all_vertices) if all_vertices else np.zeros((0, 3))
-        combined_faces = np.vstack(all_faces) if all_faces else np.zeros((0, 3), dtype=np.int32)
-
-        return combined_vertices, combined_faces
-
     def _generate_primitive_mesh(self, geom_type, geom_id):
         """Generate mesh for primitive shapes (box, cylinder, etc.)."""
         import mujoco
@@ -723,10 +740,6 @@ class Reconstruct3D(ManipulationEnv):
             faces = np.array(faces)
 
         else:
-            # Fallback for unsupported types
-            vertices = np.zeros((0, 3))
-            faces = np.zeros((0, 3), dtype=np.int32)
-            print(f"Warning: Unsupported geom type {geom_type} for mesh extraction.")
             raise NotImplementedError(f"Unsupported geom type {geom_type} for mesh extraction.")
 
         return vertices, faces
