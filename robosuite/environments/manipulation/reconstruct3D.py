@@ -203,8 +203,8 @@ class Reconstruct3D(ManipulationEnv):
         self.placement_initializer = placement_initializer
 
         # static env mesh related variables (initialized to None, computed via compute_static_env_mesh)
-        self.combined_vertices = None
-        self.combined_faces = None
+        self.static_env_vertices = None
+        self.static_env_faces = None
 
         # SDF-related object variables (initialized to None, computed via compute_static_env_sdf)
         self.sdf_grid = None
@@ -277,7 +277,29 @@ class Reconstruct3D(ManipulationEnv):
 
             return None
 
-        if reconstruction.shape == self.sdf_grid.shape:
+        # if reconstruction is mesh (vertices and faces tuple) use chamfer distance
+        if isinstance(reconstruction, tuple) and len(reconstruction) == 2:
+
+            vertices = reconstruction[0]
+            assert isinstance(vertices, np.ndarray), "Reconstruction vertices must be a numpy array"
+            assert (
+                vertices.ndim == 2 and vertices.shape[1] == 3
+            ), f"Reconstruction vertices must have shape (N, 3), got {vertices.shape}"
+
+            faces = reconstruction[1]
+            assert isinstance(faces, np.ndarray), "Reconstruction faces must be a numpy array"
+            assert (
+                faces.ndim == 2 and faces.shape[1] == 3
+            ), f"Reconstruction faces must have shape (M, 3), got {faces.shape}"
+
+            # Compute Chamfer distance between reconstructed mesh and ground truth mesh
+            error = self.compute_chamfer_distance(vertices, faces)
+
+            # Convert error to reward: reward = reward_scale * exp(-error/characteristic_error)
+            reward = self.reward_scale * np.exp(-error / self.characteristic_error)
+
+        # if reconstruction is SDF (numpy array) use elementwise error
+        elif isinstance(reconstruction, np.ndarray) and reconstruction.shape == self.sdf_grid.shape:
 
             error = self.compute_elementwise_sdf_error(reconstruction, bbox_min=bbox_min, bbox_max=bbox_max)
 
@@ -290,6 +312,104 @@ class Reconstruct3D(ManipulationEnv):
             )
 
         return reward
+
+    def compute_chamfer_distance(self, recon_vertices, recon_faces, n_samples=10000):
+        """
+        Compute the Chamfer distance between the reconstructed mesh and the ground truth mesh.
+
+        The Chamfer distance is the mean of the squared distances from points on one surface
+        to the closest points on the other surface, averaged over both directions.
+
+        Args:
+            recon_vertices (np.ndarray): Vertices of reconstructed mesh, shape (N, 3)
+            recon_faces (np.ndarray): Faces of reconstructed mesh, shape (M, 3)
+            n_samples (int): Number of points to sample from each mesh surface for distance computation.
+                Higher values give more accurate results but are slower. Default: 10000.
+
+        Returns:
+            float: Chamfer distance (lower is better, 0 means identical surfaces)
+
+        Raises:
+            RuntimeError: If ground truth mesh has not been computed yet
+        """
+        from scipy.spatial import cKDTree
+
+        # Check if ground truth mesh has been computed
+        if self.static_env_vertices is None or self.static_env_faces is None:
+            raise RuntimeError("Ground truth mesh has not been computed yet. Call compute_static_env_mesh() first.")
+
+        # Sample points from both mesh surfaces
+        gt_points = self._sample_points_from_mesh(self.static_env_vertices, self.static_env_faces, n_samples)
+        recon_points = self._sample_points_from_mesh(recon_vertices, recon_faces, n_samples)
+
+        # Build KD-trees for efficient nearest neighbor queries
+        gt_tree = cKDTree(gt_points)
+        recon_tree = cKDTree(recon_points)
+
+        # Compute distances from reconstructed points to ground truth
+        dist_recon_to_gt, _ = gt_tree.query(recon_points, k=1)
+
+        # Compute distances from ground truth points to reconstructed
+        dist_gt_to_recon, _ = recon_tree.query(gt_points, k=1)
+
+        # Chamfer distance is the mean of squared distances in both directions
+        chamfer_dist = (np.mean(dist_recon_to_gt**2) + np.mean(dist_gt_to_recon**2)) / 2
+
+        return chamfer_dist
+
+    def _sample_points_from_mesh(self, vertices, faces, n_samples):
+        """
+        Sample points uniformly from the surface of a triangle mesh.
+
+        Args:
+            vertices (np.ndarray): Mesh vertices, shape (N, 3)
+            faces (np.ndarray): Mesh faces (triangle indices), shape (M, 3)
+            n_samples (int): Number of points to sample
+
+        Returns:
+            np.ndarray: Sampled points, shape (n_samples, 3)
+        """
+        if len(faces) == 0 or len(vertices) == 0:
+            return np.zeros((n_samples, 3))
+
+        # Get triangle vertices
+        v0 = vertices[faces[:, 0]]
+        v1 = vertices[faces[:, 1]]
+        v2 = vertices[faces[:, 2]]
+
+        # Compute triangle areas for weighted sampling
+        cross = np.cross(v1 - v0, v2 - v0)
+        areas = 0.5 * np.linalg.norm(cross, axis=1)
+        total_area = areas.sum()
+
+        if total_area == 0:
+            return np.zeros((n_samples, 3))
+
+        # Normalize to get probabilities
+        probs = areas / total_area
+
+        # Sample triangle indices weighted by area
+        rng = np.random.default_rng()
+        triangle_indices = rng.choice(len(faces), size=n_samples, p=probs)
+
+        # Sample random barycentric coordinates
+        r1 = rng.random(n_samples)
+        r2 = rng.random(n_samples)
+
+        # Ensure points are inside triangles (not in the "mirrored" region)
+        sqrt_r1 = np.sqrt(r1)
+        u = 1 - sqrt_r1
+        v = sqrt_r1 * (1 - r2)
+        w = sqrt_r1 * r2
+
+        # Compute sampled points using barycentric coordinates
+        sampled_v0 = vertices[faces[triangle_indices, 0]]
+        sampled_v1 = vertices[faces[triangle_indices, 1]]
+        sampled_v2 = vertices[faces[triangle_indices, 2]]
+
+        points = u[:, np.newaxis] * sampled_v0 + v[:, np.newaxis] * sampled_v1 + w[:, np.newaxis] * sampled_v2
+
+        return points
 
     def compute_elementwise_sdf_error(self, input_sdf, bbox_min=None, bbox_max=None, power=2):
         """
@@ -504,10 +624,10 @@ class Reconstruct3D(ManipulationEnv):
             vertex_offset += len(vertices)
 
         # Combine all meshes
-        self.combined_vertices = np.vstack(all_vertices) if all_vertices else np.zeros((0, 3))
-        self.combined_faces = np.vstack(all_faces) if all_faces else np.zeros((0, 3), dtype=np.int32)
+        self.static_env_vertices = np.vstack(all_vertices) if all_vertices else np.zeros((0, 3))
+        self.static_env_faces = np.vstack(all_faces) if all_faces else np.zeros((0, 3), dtype=np.int32)
 
-        return self.combined_vertices, self.combined_faces
+        return self.static_env_vertices, self.static_env_faces
 
     def _load_model(self):
         """
