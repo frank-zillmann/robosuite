@@ -282,12 +282,20 @@ class Reconstruct3D(ManipulationEnv):
 
             vertices = reconstruction[0]
             assert isinstance(vertices, np.ndarray), "Reconstruction vertices must be a numpy array"
-            assert (
-                vertices.ndim == 2 and vertices.shape[1] == 3
-            ), f"Reconstruction vertices must have shape (N, 3), got {vertices.shape}"
 
             faces = reconstruction[1]
             assert isinstance(faces, np.ndarray), "Reconstruction faces must be a numpy array"
+
+            # Handle empty mesh (no observations yet)
+            if len(vertices) == 0:
+                from robosuite.utils.log_utils import ROBOSUITE_DEFAULT_LOGGER
+
+                ROBOSUITE_DEFAULT_LOGGER.warning("Reconstruction mesh contains no vertices. Returning 0 reward.")
+                return 0.0  # Minimum reward for empty reconstruction
+
+            assert (
+                vertices.ndim == 2 and vertices.shape[1] == 3
+            ), f"Reconstruction vertices must have shape (N, 3), got {vertices.shape}"
             assert (
                 faces.ndim == 2 and faces.shape[1] == 3
             ), f"Reconstruction faces must have shape (M, 3), got {faces.shape}"
