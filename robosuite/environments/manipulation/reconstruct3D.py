@@ -269,12 +269,9 @@ class Reconstruct3D(ManipulationEnv):
             float: reward value (higher is better, max is reward_scale when error is 0)
         """
         if reconstruction is None:
-            from robosuite.utils.log_utils import ROBOSUITE_DEFAULT_LOGGER
-
-            ROBOSUITE_DEFAULT_LOGGER.warning(
-                "No reconstruction provided. Returning None reward. Expected during automatic call during step but not when called directly."
-            )
-
+            # This happens when reward() is called automatically by the parent step() method
+            # which doesn't pass the reconstruction parameter. This is expected behavior.
+            # The Gym wrapper will call reward() again manually with the reconstruction.
             return None
 
         # if reconstruction is mesh (vertices and faces tuple) use chamfer distance
@@ -286,11 +283,8 @@ class Reconstruct3D(ManipulationEnv):
             faces = reconstruction[1]
             assert isinstance(faces, np.ndarray), "Reconstruction faces must be a numpy array"
 
-            # Handle empty mesh (no observations yet)
+            # Handle empty mesh (no observations yet - expected during early training)
             if len(vertices) == 0:
-                from robosuite.utils.log_utils import ROBOSUITE_DEFAULT_LOGGER
-
-                ROBOSUITE_DEFAULT_LOGGER.warning("Reconstruction mesh contains no vertices. Returning 0 reward.")
                 return 0.0  # Minimum reward for empty reconstruction
 
             assert (
