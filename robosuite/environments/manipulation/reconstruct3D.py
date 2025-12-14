@@ -189,7 +189,7 @@ class Reconstruct3D(ManipulationEnv):
         sdf_size=32,
         sdf_padding=0.05,
         reward_scale=1.0,
-        characteristic_error=0.05,
+        characteristic_error=0.01,
     ):
         # settings for table top
         self.table_full_size = table_full_size
