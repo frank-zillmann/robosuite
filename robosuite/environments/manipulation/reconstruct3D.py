@@ -300,6 +300,14 @@ class Reconstruct3D(ManipulationEnv):
             # Compute Chamfer distance between reconstructed mesh and ground truth mesh
             error = self.compute_chamfer_distance(vertices, faces)
 
+            # # test convergence of chamfer_distance with increasing samples (debugging)
+            # error_100 = self.compute_chamfer_distance(vertices, faces, n_samples=100)
+            # error_1000 = self.compute_chamfer_distance(vertices, faces, n_samples=1000)
+            # error_5000 = self.compute_chamfer_distance(vertices, faces, n_samples=5000)
+            # print(
+            #     f"[Reconstruct3D Chamfer Distance] Error (100 samples): {error_100:.6f}, (1000 samples): {error_1000:.6f}, (5000 samples): {error_5000:.6f}, (10000 samples): {error:.6f}"
+            # )
+
             # Convert error to reward: reward = reward_scale * exp(-error/characteristic_error)
             reward = self.reward_scale * np.exp(-error / self.characteristic_error)
 
