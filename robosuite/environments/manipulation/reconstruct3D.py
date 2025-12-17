@@ -246,7 +246,7 @@ class Reconstruct3D(ManipulationEnv):
             seed=seed,
         )
 
-    def reward(self, action=None, reconstruction=None, bbox_min=None, bbox_max=None):
+    def reward(self, action=None, reconstruction=None, bbox_min=None, bbox_max=None, output_error=False):
         """
         Reward function for the 3D reconstruction task.
 
@@ -285,7 +285,10 @@ class Reconstruct3D(ManipulationEnv):
 
             # Handle empty mesh (no observations yet - expected during early training)
             if len(vertices) == 0:
-                return 0.0  # Minimum reward for empty reconstruction
+                if output_error:
+                    return 0.0, float('inf')  # Minimum reward, infinite error for empty reconstruction
+                else:
+                    return 0.0  # Minimum reward for empty reconstruction
 
             assert (
                 vertices.ndim == 2 and vertices.shape[1] == 3
@@ -313,7 +316,10 @@ class Reconstruct3D(ManipulationEnv):
                 f"Input reconstruction shape does not match any expected reconstruction format. Type: {type(reconstruction)}, shape: {reconstruction.shape}"
             )
 
-        return reward
+        if output_error:
+            return reward, error
+        else:
+            return reward
 
     def compute_chamfer_distance(self, recon_vertices, recon_faces, n_samples=10000):
         """
