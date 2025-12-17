@@ -544,9 +544,15 @@ class Reconstruct3D(ManipulationEnv):
 
         return self.sdf_grid, self.sdf_bbox_center, self.sdf_bbox_size
 
-    def compute_static_env_mesh(self, geom_groups=None):
+    def compute_static_env_mesh(self, geom_groups=None, exclude_table_legs=True):
         """
         Extract static environment mesh (table + objects) from MuJoCo simulation.
+
+        Args:
+            geom_groups (list of int, optional): Geom groups to include in mesh extraction.
+                Use [0] for collision geoms only to avoid duplicates.
+            exclude_table_legs (bool): If True, exclude table leg geoms (keep only table top).
+                Default is True.
 
         Returns:
             tuple: (vertices, faces) where:
@@ -590,6 +596,10 @@ class Reconstruct3D(ManipulationEnv):
             # Get geom pose
             geom_pos = self.sim.data.geom_xpos[geom_id]
             geom_mat = self.sim.data.geom_xmat[geom_id].reshape(3, 3)
+
+            # Exclude table legs: table legs are cylinders (type=5), table top is box (type=6)
+            if exclude_table_legs and body_name == "table" and geom_type == mujoco.mjtGeom.mjGEOM_CYLINDER:
+                continue
 
             # Handle meshes
             if geom_type == mujoco.mjtGeom.mjGEOM_MESH:
@@ -835,29 +845,40 @@ class Reconstruct3D(ManipulationEnv):
             vertices = []
             faces = []
 
-            # Generate vertices
+            # Generate vertices for cylinder wall
+            # Bottom ring vertices at even indices (0, 2, 4, ...)
+            # Top ring vertices at odd indices (1, 3, 5, ...)
             for i in range(n_segments):
                 angle = 2 * np.pi * i / n_segments
                 x, y = radius * np.cos(angle), radius * np.sin(angle)
-                vertices.append([x, y, -half_height])
-                vertices.append([x, y, half_height])
+                vertices.append([x, y, -half_height])  # bottom ring
+                vertices.append([x, y, half_height])  # top ring
 
             # Add center vertices for caps
-            vertices.append([0, 0, -half_height])
-            vertices.append([0, 0, half_height])
+            bottom_center_idx = 2 * n_segments
+            top_center_idx = 2 * n_segments + 1
+            vertices.append([0, 0, -half_height])  # bottom center
+            vertices.append([0, 0, half_height])  # top center
 
             vertices = np.array(vertices)
 
             # Generate faces
             for i in range(n_segments):
-                i1, i2 = 2 * i, 2 * ((i + 1) % n_segments)
-                # Side faces
-                faces.append([i1, i2, i1 + 1])
-                faces.append([i1 + 1, i2, i2 + 1])
-                # Bottom cap
-                faces.append([2 * n_segments, i1, i2])
-                # Top cap
-                faces.append([2 * n_segments + 1, i2 + 1, i1 + 1])
+                # Current and next segment indices
+                curr_bottom = 2 * i
+                curr_top = 2 * i + 1
+                next_bottom = 2 * ((i + 1) % n_segments)
+                next_top = 2 * ((i + 1) % n_segments) + 1
+
+                # Side faces (two triangles per segment)
+                faces.append([curr_bottom, next_bottom, curr_top])
+                faces.append([curr_top, next_bottom, next_top])
+
+                # Bottom cap (winding for outward normal pointing -z)
+                faces.append([bottom_center_idx, next_bottom, curr_bottom])
+
+                # Top cap (winding for outward normal pointing +z)
+                faces.append([top_center_idx, curr_top, next_top])
 
             faces = np.array(faces)
 
