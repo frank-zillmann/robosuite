@@ -176,7 +176,7 @@ class Reconstruct3D(ManipulationEnv):
         lite_physics=True,
         horizon=100,
         ignore_done=True,
-        hard_reset=True,
+        hard_reset=False,
         camera_names="robot0_eye_in_hand",
         camera_heights=128,
         camera_widths=128,
@@ -286,7 +286,7 @@ class Reconstruct3D(ManipulationEnv):
             # Handle empty mesh (no observations yet - expected during early training)
             if len(vertices) == 0:
                 if output_error:
-                    return 0.0, float('inf')  # Minimum reward, infinite error for empty reconstruction
+                    return 0.0, float("inf")  # Minimum reward, infinite error for empty reconstruction
                 else:
                     return 0.0  # Minimum reward for empty reconstruction
 
