@@ -246,27 +246,43 @@ class Reconstruct3D(ManipulationEnv):
             seed=seed,
         )
 
-    def reward(self, action=None, reconstruction=None, bbox_min=None, bbox_max=None, output_error=False):
+    def reward(
+        self,
+        action=None,
+        reconstruction=None,
+        reconstruction_metric=None,
+        truncation_distance=None,
+        sdf_alpha=0.8,
+        sdf_unobserved_penalty=0.1,
+        output_error=False,
+    ):
         """
         Reward function for the 3D reconstruction task.
 
-        The reward is based on the negative squared error between the input SDF (from reconstruction)
-        and the ground truth SDF. Lower reconstruction error yields higher reward.
+        The reward is based on the reconstruction error (Chamfer distance or SDF error)
+        between the reconstructed and ground truth representations.
+        Lower reconstruction error yields higher reward.
 
         Note that the final reward is normalized and scaled by reward_scale so that the max score
         is equal to reward_scale (when error is 0).
 
         Args:
             action (np array): [NOT USED] Robot action for compatibility with robosuite API
-            input_sdf (np.ndarray): Input SDF grid from reconstruction to compare against ground truth.
-                If None, returns 0 with a warning.
-            bbox_min (np.ndarray, optional): Minimum corner of bounding box in global coordinates
-                for selective error computation. Shape (3,).
-            bbox_max (np.ndarray, optional): Maximum corner of bounding box in global coordinates
-                for selective error computation. Shape (3,).
+            reconstruction: The reconstruction data. Type depends on reconstruction_metric:
+                - For "chamfer_distance": tuple (vertices, faces) where vertices is (N, 3) and faces is (M, 3)
+                - For "elementwise_sdf_error": numpy array of shape (sdf_size, sdf_size, sdf_size)
+            reconstruction_metric (str): The metric to use for reward computation.
+                Must be one of: "chamfer_distance", "elementwise_sdf_error".
+                If None, will infer from reconstruction type (deprecated behavior).
+            truncation_distance (float): TSDF truncation distance in meters. Used for SDF error.
+            sdf_alpha (float): Fraction of truncation_distance within which voxels are expected
+                to be observed. Default 0.8.
+            sdf_unobserved_penalty (float): Penalty for voxels that should be observed but aren't.
+            output_error (bool): If True, also return the raw error value.
 
         Returns:
             float: reward value (higher is better, max is reward_scale when error is 0)
+            If output_error=True, returns tuple (reward, error)
         """
         if reconstruction is None:
             # This happens when reward() is called automatically by the parent step() method
@@ -274,13 +290,11 @@ class Reconstruct3D(ManipulationEnv):
             # The Gym wrapper will call reward() again manually with the reconstruction.
             return None
 
-        # if reconstruction is mesh (vertices and faces tuple) use chamfer distance
-        if isinstance(reconstruction, tuple) and len(reconstruction) == 2:
-
-            vertices = reconstruction[0]
+        # Compute error based on metric
+        if reconstruction_metric == "chamfer_distance":
+            vertices, faces = reconstruction
+            
             assert isinstance(vertices, np.ndarray), "Reconstruction vertices must be a numpy array"
-
-            faces = reconstruction[1]
             assert isinstance(faces, np.ndarray), "Reconstruction faces must be a numpy array"
 
             # Handle empty mesh (no observations yet - expected during early training)
@@ -300,29 +314,25 @@ class Reconstruct3D(ManipulationEnv):
             # Compute Chamfer distance between reconstructed mesh and ground truth mesh
             error = self.compute_chamfer_distance(vertices, faces)
 
-            # # test convergence of chamfer_distance with increasing samples (debugging)
-            # error_100 = self.compute_chamfer_distance(vertices, faces, n_samples=100)
-            # error_1000 = self.compute_chamfer_distance(vertices, faces, n_samples=1000)
-            # error_5000 = self.compute_chamfer_distance(vertices, faces, n_samples=5000)
-            # print(
-            #     f"[Reconstruct3D Chamfer Distance] Error (100 samples): {error_100:.6f}, (1000 samples): {error_1000:.6f}, (5000 samples): {error_5000:.6f}, (10000 samples): {error:.6f}"
-            # )
-
-            # Convert error to reward: reward = reward_scale * exp(-error/characteristic_error)
-            reward = self.reward_scale * np.exp(-error / self.characteristic_error)
-
-        # if reconstruction is SDF (numpy array) use elementwise error
-        elif isinstance(reconstruction, np.ndarray) and reconstruction.shape == self.sdf_grid.shape:
-
-            error = self.compute_elementwise_sdf_error(reconstruction, bbox_min=bbox_min, bbox_max=bbox_max)
-
-            # Convert error to reward: reward = reward_scale * exp(-error/characteristic_error)
-            reward = self.reward_scale * np.exp(-error / self.characteristic_error)
+        elif reconstruction_metric == "elementwise_sdf_error":
+            error = self.compute_elementwise_sdf_error(
+                reconstruction,
+                truncation_distance=truncation_distance,
+                alpha=sdf_alpha,
+                unobserved_penalty=sdf_unobserved_penalty,
+            )
 
         else:
             raise ValueError(
-                f"Input reconstruction shape does not match any expected reconstruction format. Type: {type(reconstruction)}, shape: {reconstruction.shape}"
+                f"Unknown reconstruction_metric: '{reconstruction_metric}'. "
             )
+
+        # Handle infinite error (no observed voxels or empty reconstruction)
+        if np.isinf(error):
+            reward = 0.0
+        else:
+            # Convert error to reward: reward = reward_scale * exp(-error/characteristic_error)
+            reward = self.reward_scale * np.exp(-error / self.characteristic_error)
 
         if output_error:
             return reward, error
@@ -427,21 +437,41 @@ class Reconstruct3D(ManipulationEnv):
 
         return points
 
-    def compute_elementwise_sdf_error(self, input_sdf, bbox_min=None, bbox_max=None, power=2):
+    def compute_elementwise_sdf_error(
+        self,
+        input_sdf,
+        truncation_distance,
+        alpha=0.8,
+        unobserved_penalty=0.1,
+        power=2,
+        unobserved_threshold=90.0,
+    ):
         """
-        Compute the squared componentwise error between an input SDF and the stored ground truth SDF.
+        Compute the elementwise error between an input TSDF and the stored ground truth SDF.
+
+        This method computes error in two parts:
+        1. For observed voxels (not truncated): MSE between TSDF and clamped ground truth
+        2. For voxels that should have been observed but weren't: fixed penalty
+
+        A voxel "should have been observed" if its ground truth SDF is within
+        alpha * truncation_distance (i.e., it's near the surface).
 
         Args:
-            input_sdf (np.ndarray): Input SDF grid to compare against ground truth.
+            input_sdf (np.ndarray): Input TSDF grid to compare against ground truth.
                 Must have the same shape as self.sdf_grid.
-            bbox_min (np.ndarray, optional): Minimum corner of bounding box in global coordinates
-                for selective error computation. Shape (3,). If None, uses entire grid.
-            bbox_max (np.ndarray, optional): Maximum corner of bounding box in global coordinates
-                for selective error computation. Shape (3,). If None, uses entire grid.
-            power (float): Power to raise absolute difference to when computing error. Default is 2 (squared error).
+            truncation_distance (float): The truncation distance used by the TSDF (in meters).
+            alpha (float): Fraction of truncation_distance within which voxels are expected
+                to be observed. Voxels with |GT SDF| < alpha * truncation_distance should
+                have been observed. Default 0.8.
+            unobserved_penalty (float): Fixed penalty added for each voxel that should have
+                been observed but wasn't. Default 0.1.
+            power (float): Power to raise absolute difference to. Default 2 (squared error).
+            unobserved_threshold (float): Threshold above which TSDF values are considered
+                unobserved (sentinel value). Default 90.0.
 
         Returns:
-            float: Mean squared error between input SDF and ground truth SDF (within bounding box if specified)
+            float: Combined error (MSE on observed + penalty for missing observations).
+                   Returns inf if no voxels are observed and none should have been.
 
         Raises:
             RuntimeError: If compute_static_env_sdf has not been called yet
@@ -449,67 +479,54 @@ class Reconstruct3D(ManipulationEnv):
         """
         # Check if SDF has been computed
         if self.sdf_grid is None:
-            raise RuntimeError("Ground truth SDF has not been computed yet. " "Call compute_static_env_sdf() first.")
+            raise RuntimeError("Ground truth SDF has not been computed yet. Call compute_static_env_sdf() first.")
 
         # Check shape match
         if input_sdf.shape != self.sdf_grid.shape:
             raise ValueError(
-                f"Input SDF shape {input_sdf.shape} does not match " f"ground truth SDF shape {self.sdf_grid.shape}"
+                f"Input SDF shape {input_sdf.shape} does not match ground truth SDF shape {self.sdf_grid.shape}"
             )
 
-        # If no bounding box specified, compute error over entire grid
-        if bbox_min is None or bbox_max is None:
-            sdf_should = self.sdf_grid
-            sdf_is = input_sdf
+        sdf_is = input_sdf
+        sdf_should = self.sdf_grid
 
+        # Identify observed voxels (TSDF values below sentinel threshold)
+        observed_mask = np.abs(sdf_is) < unobserved_threshold
+
+        # Identify voxels that should have been observed (GT SDF within alpha * truncation_distance)
+        should_observe_mask = np.abs(sdf_should) < (alpha * truncation_distance)
+
+        # Count statistics
+        n_observed = observed_mask.sum()
+        n_should_observe = should_observe_mask.sum()
+        n_missing = (should_observe_mask & ~observed_mask).sum()  # Should observe but didn't
+
+        # If nothing to evaluate, return infinity
+        if n_observed == 0 and n_should_observe == 0:
+            return float("inf")
+
+        # Part 1: Compute MSE on observed voxels
+        if n_observed > 0:
+            sdf_is_observed = sdf_is[observed_mask]
+            sdf_should_observed = sdf_should[observed_mask]
+
+            # Clamp ground truth to truncation range for fair comparison
+            sdf_should_clamped = np.clip(sdf_should_observed, -truncation_distance, truncation_distance)
+
+            # Compute squared error on observed voxels
+            observed_error = np.sum(np.abs(sdf_is_observed - sdf_should_clamped) ** power)
         else:
+            observed_error = 0.0
 
-            # Convert bounding box from global coordinates to grid indices
-            bbox_min = np.asarray(bbox_min)
-            bbox_max = np.asarray(bbox_max)
+        # Part 2: Add penalty for missing observations
+        missing_penalty = n_missing * (unobserved_penalty ** power)
 
-            # Transform global coordinates to normalized coordinates [-1, 1]
-            normalized_min = (bbox_min - self.sdf_bbox_center) / (self.sdf_bbox_size / 2)
-            normalized_max = (bbox_max - self.sdf_bbox_center) / (self.sdf_bbox_size / 2)
+        # Combine: total error normalized by number of voxels that should be observed
+        # This gives a fair comparison regardless of how much has been observed
+        total_voxels = max(n_should_observe, n_observed)  # Avoid division by zero
+        combined_error = (observed_error + missing_penalty) / total_voxels
 
-            # Transform normalized coordinates to grid indices [0, sdf_size-1]
-            grid_min = ((normalized_min + 1) / 2 * self.sdf_size).astype(int)
-            grid_max = ((normalized_max + 1) / 2 * self.sdf_size).astype(int)
-
-            if (grid_min >= grid_max).any():
-                raise ValueError(
-                    f"Invalid bounding box specified: min corner index is not less than max corner index. "
-                    f"grid_min: {grid_min}, grid_max: {grid_max}"
-                )
-
-            # Clip to valid grid range
-            if (
-                (grid_min < 0).any()
-                or (grid_min >= self.sdf_size).any()
-                or (grid_max < 0).any()
-                or (grid_max >= self.sdf_size).any()
-            ):
-                from robosuite.utils.log_utils import ROBOSUITE_DEFAULT_LOGGER
-
-                ROBOSUITE_DEFAULT_LOGGER.warning(
-                    f"Bounding box indices out of grid range. Clipping to valid range."
-                    f" grid_min: {grid_min}, grid_max: {grid_max}"
-                )
-
-            grid_min = np.clip(grid_min, 0, self.sdf_size - 1)
-            grid_max = np.clip(grid_max, 0, self.sdf_size - 1)
-
-            # Extract subgrids within bounding box
-            sdf_is = input_sdf[
-                grid_min[0] : grid_max[0] + 1, grid_min[1] : grid_max[1] + 1, grid_min[2] : grid_max[2] + 1
-            ]
-            sdf_should = self.sdf_grid[
-                grid_min[0] : grid_max[0] + 1, grid_min[1] : grid_max[1] + 1, grid_min[2] : grid_max[2] + 1
-            ]
-
-        abs_diff = np.abs(sdf_is - sdf_should)
-        mse = np.mean(abs_diff**power)
-        return mse
+        return combined_error
 
     def compute_static_env_sdf(self, geom_groups=None):
         """
