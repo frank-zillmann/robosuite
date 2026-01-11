@@ -436,7 +436,7 @@ class Reconstruct3D(ManipulationEnv):
         input_sdf,
         truncation_distance: float,
         alpha=0.8,
-        unobserved_penalty=0.1,
+        unobserved_penalty=1.0,
         power=2,
         unobserved_threshold=90.0,
     ):
@@ -457,8 +457,8 @@ class Reconstruct3D(ManipulationEnv):
             alpha (float): Fraction of truncation_distance within which voxels are expected
                 to be observed. Voxels with |GT SDF| < alpha * truncation_distance should
                 have been observed. Default 0.8.
-            unobserved_penalty (float): Fixed penalty added for each voxel that should have
-                been observed but wasn't. Default 0.1.
+            unobserved_penalty (float): Fixed penalty added for the fraction of missing voxels
+                that should have been observed. Default 1.0.
             power (float): Power to raise absolute difference to. Default 2 (squared error).
             unobserved_threshold (float): Threshold above which TSDF values are considered
                 unobserved (sentinel value). Default 90.0.
@@ -496,8 +496,10 @@ class Reconstruct3D(ManipulationEnv):
             # Clamp ground truth to truncation range for fair comparison
             # sdf_should_observed = np.clip(sdf_should_observed, -truncation_distance, truncation_distance)
 
-            # Compute squared error on observed voxels
-            observed_error = np.mean(np.abs(sdf_is_observed - sdf_should_observed) ** power)
+            # Compute squared error on observed 
+            diff = np.abs(sdf_is_observed - sdf_should_observed)
+            mean_diff_power = np.mean(np.power(diff, power))
+            observed_error = np.power(mean_diff_power, 1/power)
         else:
             observed_error = 0.0
 
@@ -509,7 +511,9 @@ class Reconstruct3D(ManipulationEnv):
         # Count voxels that should have been observed but weren't
         n_missing = (should_observe_mask & ~observed_mask).sum()
 
-        missing_penalty = n_missing * unobserved_penalty # TODO: make independent of SDF size
+        missing_penalty = (n_missing / n_should_observe) * unobserved_penalty # TODO: make independent of SDF size
+
+        print(f"Voxelwise TSDF Error Computation: Observed Voxels = {n_observed}, Should Observe = {n_should_observe}, Missing = {n_missing}, Observed Error = {observed_error:.6f}, Missing Penalty = {missing_penalty:.6f}")
 
         return observed_error + missing_penalty
 
