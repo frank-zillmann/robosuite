@@ -271,8 +271,9 @@ class Reconstruct3D(ManipulationEnv):
             reconstruction: The reconstruction data. Type depends on reconstruction_metric:
                 - For "chamfer_distance": tuple (vertices, faces) where vertices is (N, 3) and faces is (M, 3)
                 - For "elementwise_sdf_error": numpy array of shape (sdf_size, sdf_size, sdf_size)
+                - For "sparse_sdf_error": dict with 'positions', 'sdf_values', 'truncation_distance'
             reconstruction_metric (str): The metric to use for reward computation.
-                Must be one of: "chamfer_distance", "elementwise_sdf_error".
+                Must be one of: "chamfer_distance", "elementwise_sdf_error", "sparse_sdf_error".
                 If None, will infer from reconstruction type (deprecated behavior).
             truncation_distance (float): TSDF truncation distance in meters. Used for SDF error.
             sdf_alpha (float): Fraction of truncation_distance within which voxels are expected
@@ -314,10 +315,24 @@ class Reconstruct3D(ManipulationEnv):
             # Compute Chamfer distance between reconstructed mesh and ground truth mesh
             error = self.compute_chamfer_distance(vertices, faces)
 
-        elif reconstruction_metric == "elementwise_sdf_error":
-            error = self.compute_elementwise_sdf_error(
+        elif reconstruction_metric == "tsdf_dense_error":
+            error = self.compute_tsdf_dense_error(
                 reconstruction,
                 truncation_distance=truncation_distance,
+                alpha=sdf_alpha,
+                unobserved_penalty=sdf_unobserved_penalty,
+            )
+
+        elif reconstruction_metric == "tsdf_sparse_error":
+            # Handle empty reconstruction (no observations yet)
+            if len(reconstruction.get('positions', [])) == 0:
+                if output_error:
+                    return 0.0, float("inf")
+                else:
+                    return 0.0
+
+            error = self.compute_tsdf_sparse_error(
+                reconstruction,
                 alpha=sdf_alpha,
                 unobserved_penalty=sdf_unobserved_penalty,
             )
@@ -437,7 +452,7 @@ class Reconstruct3D(ManipulationEnv):
 
         return points
 
-    def compute_elementwise_sdf_error(
+    def compute_tsdf_dense_error(
         self,
         input_sdf,
         truncation_distance,
@@ -447,7 +462,7 @@ class Reconstruct3D(ManipulationEnv):
         unobserved_threshold=90.0,
     ):
         """
-        Compute the elementwise error between an input TSDF and the stored ground truth SDF.
+        Compute error between a dense TSDF grid and the stored ground truth SDF.
 
         This method computes error in two parts:
         1. For observed voxels (not truncated): MSE between TSDF and clamped ground truth
@@ -524,6 +539,106 @@ class Reconstruct3D(ManipulationEnv):
         # Combine: total error normalized by number of voxels that should be observed
         # This gives a fair comparison regardless of how much has been observed
         total_voxels = max(n_should_observe, n_observed)  # Avoid division by zero
+        combined_error = (observed_error + missing_penalty) / total_voxels
+
+        return combined_error
+
+    def compute_tsdf_sparse_error(
+        self,
+        sparse_sdf_data,
+        alpha=0.8,
+        unobserved_penalty=0.1,
+        power=2,
+    ):
+        """
+        Compute SDF error from sparse TSDF data (observed voxels only).
+
+        Args:
+            sparse_sdf_data (dict): Dictionary containing:
+                - 'positions': (N, 3) world coordinates of observed voxels
+                - 'sdf_values': (N,) TSDF values at those positions
+                - 'truncation_distance': float, the truncation distance used
+            alpha (float): Fraction of truncation_distance defining "near surface" region.
+                Voxels with |GT SDF| < alpha * truncation_distance should have been observed.
+            unobserved_penalty (float): Fixed penalty for each surface voxel not observed.
+            power (float): Power to raise absolute difference to. Default 2 (squared error).
+
+        Returns:
+            float: Combined error (MSE on observed + penalty for missing surface voxels).
+        """
+        from scipy.ndimage import map_coordinates
+
+        if self.sdf_grid is None:
+            raise RuntimeError("Ground truth SDF has not been computed yet. Call compute_static_env_sdf() first.")
+
+        positions = sparse_sdf_data['positions']
+        sdf_values = sparse_sdf_data['sdf_values']
+        truncation_distance = sparse_sdf_data['truncation_distance']
+
+        n_observed = len(positions)
+
+        # Part 1: Compute error on observed voxels
+        if n_observed > 0:
+            # Transform world coordinates to normalized [-1, 1] space
+            # world = normalized * (bbox_size/2) + bbox_center
+            # => normalized = (world - bbox_center) / (bbox_size/2)
+            positions_normalized = (positions - self.sdf_bbox_center) / (self.sdf_bbox_size / 2)
+
+            # Transform normalized coords to grid indices for interpolation
+            # normalized [-1, 1] => grid index [0, sdf_size-1]
+            grid_size = self.sdf_grid.shape[0]
+            grid_coords = (positions_normalized + 1) / 2 * (grid_size - 1)
+
+            # Sample ground truth SDF at observed positions using trilinear interpolation
+            # map_coordinates expects (3, N) array of coordinates
+            gt_sdf_at_observed = map_coordinates(
+                self.sdf_grid,
+                grid_coords.T,
+                order=1,  # Linear interpolation
+                mode='constant',
+                cval=0.0,  # Outside grid treated as 0 (on surface)
+            )
+
+            # Scale ground truth SDF from normalized space to world space
+            # mesh2sdf operates in normalized [-1,1] space, so SDF values are also normalized
+            # To compare with TSDF in meters, we need to scale: world_sdf = normalized_sdf * (bbox_size/2)
+            gt_sdf_world = gt_sdf_at_observed * (self.sdf_bbox_size / 2)
+
+            # Clamp ground truth to truncation range for fair comparison
+            gt_sdf_clamped = np.clip(gt_sdf_world, -truncation_distance, truncation_distance)
+
+            # Compute error on observed voxels
+            observed_error = np.sum(np.abs(sdf_values - gt_sdf_clamped) ** power)
+        else:
+            observed_error = 0.0
+
+        # Part 2: Count surface voxels in ground truth that should have been observed
+        # A voxel "should be observed" if |GT SDF| < alpha * truncation_distance
+        # We need to count how many such voxels exist in GT and weren't observed
+
+        # Scale truncation to normalized space for comparison with GT grid
+        truncation_normalized = truncation_distance / (self.sdf_bbox_size / 2)
+        should_observe_threshold = alpha * truncation_normalized
+
+        # Count surface voxels in ground truth
+        n_surface_voxels_gt = np.sum(np.abs(self.sdf_grid) < should_observe_threshold)
+
+        # Estimate how many of those are covered by observed voxels
+        # For each observed voxel that's within the surface region, count it as covered
+        if n_observed > 0:
+            n_covered = np.sum(np.abs(gt_sdf_at_observed) < should_observe_threshold)
+        else:
+            n_covered = 0
+
+        # Missing surface voxels = total surface voxels - covered ones
+        # This is approximate but reasonable for penalization
+        n_missing = max(0, n_surface_voxels_gt - n_covered)
+
+        # Add penalty for missing surface observations
+        missing_penalty = n_missing * (unobserved_penalty ** power)
+
+        # Combine and normalize
+        total_voxels = max(n_surface_voxels_gt, n_observed, 1)
         combined_error = (observed_error + missing_penalty) / total_voxels
 
         return combined_error
