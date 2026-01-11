@@ -252,8 +252,6 @@ class Reconstruct3D(ManipulationEnv):
         reconstruction=None,
         reconstruction_metric=None,
         truncation_distance=None,
-        sdf_alpha=0.8,
-        sdf_unobserved_penalty=0.1,
         output_error=False,
     ):
         """
@@ -274,9 +272,6 @@ class Reconstruct3D(ManipulationEnv):
             reconstruction_metric (str): The metric to use for reward computation.
                 Must be one of: "chamfer_distance", "voxelwise_tsdf_error".
             truncation_distance (float): TSDF truncation distance in meters. Used for SDF error.
-            sdf_alpha (float): Fraction of truncation_distance within which voxels are expected
-                to be observed. Default 0.8.
-            sdf_unobserved_penalty (float): Penalty for voxels that should be observed but aren't.
             output_error (bool): If True, also return the raw error value.
 
         Returns:
@@ -319,8 +314,6 @@ class Reconstruct3D(ManipulationEnv):
             error = self.compute_voxelwise_tsdf_error(
                 sdf_grid,
                 truncation_distance=truncation_distance,
-                alpha=sdf_alpha,
-                unobserved_penalty=sdf_unobserved_penalty,
             )
 
         else:
@@ -441,7 +434,7 @@ class Reconstruct3D(ManipulationEnv):
     def compute_voxelwise_tsdf_error(
         self,
         input_sdf,
-        truncation_distance,
+        truncation_distance: float,
         alpha=0.8,
         unobserved_penalty=0.1,
         power=2,
@@ -493,18 +486,7 @@ class Reconstruct3D(ManipulationEnv):
 
         # Identify observed voxels (TSDF values below sentinel threshold)
         observed_mask = np.abs(sdf_is) < unobserved_threshold
-
-        # Identify voxels that should have been observed (GT SDF within alpha * truncation_distance)
-        should_observe_mask = np.abs(sdf_should) < (alpha * truncation_distance)
-
-        # Count statistics
         n_observed = observed_mask.sum()
-        n_should_observe = should_observe_mask.sum()
-        n_missing = (should_observe_mask & ~observed_mask).sum()  # Should observe but didn't
-
-        # If nothing to evaluate, return infinity
-        if n_observed == 0 and n_should_observe == 0:
-            return float("inf")
 
         # Part 1: Compute MSE on observed voxels
         if n_observed > 0:
@@ -512,22 +494,24 @@ class Reconstruct3D(ManipulationEnv):
             sdf_should_observed = sdf_should[observed_mask]
 
             # Clamp ground truth to truncation range for fair comparison
-            sdf_should_clamped = np.clip(sdf_should_observed, -truncation_distance, truncation_distance)
+            # sdf_should_observed = np.clip(sdf_should_observed, -truncation_distance, truncation_distance)
 
             # Compute squared error on observed voxels
-            observed_error = np.sum(np.abs(sdf_is_observed - sdf_should_clamped) ** power)
+            observed_error = np.mean(np.abs(sdf_is_observed - sdf_should_observed) ** power)
         else:
             observed_error = 0.0
 
         # Part 2: Add penalty for missing observations
-        missing_penalty = n_missing * (unobserved_penalty ** power)
+        # Identify voxels that should have been observed (GT SDF within alpha * truncation_distance)
+        should_observe_mask = np.abs(sdf_should) < (alpha * truncation_distance)
+        n_should_observe = should_observe_mask.sum()
+        
+        # Count voxels that should have been observed but weren't
+        n_missing = (should_observe_mask & ~observed_mask).sum()
 
-        # Combine: total error normalized by number of voxels that should be observed
-        # This gives a fair comparison regardless of how much has been observed
-        total_voxels = max(n_should_observe, n_observed)  # Avoid division by zero
-        combined_error = (observed_error + missing_penalty) / total_voxels
+        missing_penalty = n_missing * unobserved_penalty # TODO: make independent of SDF size
 
-        return combined_error
+        return observed_error + missing_penalty
 
     def compute_static_env_sdf(self, geom_groups=[0]):
         """
