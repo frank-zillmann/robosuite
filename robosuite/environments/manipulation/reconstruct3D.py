@@ -190,6 +190,7 @@ class Reconstruct3D(ManipulationEnv):
         sdf_padding=0.05,
         reward_scale=1.0,
         characteristic_error=0.01,
+        action_penalty_scale=0.0,
     ):
         # settings for table top
         self.table_full_size = table_full_size
@@ -213,9 +214,10 @@ class Reconstruct3D(ManipulationEnv):
         self.sdf_size = sdf_size
         self.sdf_padding = sdf_padding
 
-        # Reward scaling
+        # Reward scaling and penalties
         self.reward_scale = reward_scale
         self.characteristic_error = characteristic_error
+        self.action_penalty_scale = action_penalty_scale
 
         super().__init__(
             robots=robots,
@@ -287,7 +289,7 @@ class Reconstruct3D(ManipulationEnv):
         # Compute error based on metric
         if reconstruction_metric == "chamfer_distance":
             vertices, faces = reconstruction
-            
+
             assert isinstance(vertices, np.ndarray), "Reconstruction vertices must be a numpy array"
             assert isinstance(faces, np.ndarray), "Reconstruction faces must be a numpy array"
 
@@ -317,9 +319,7 @@ class Reconstruct3D(ManipulationEnv):
             )
 
         else:
-            raise ValueError(
-                f"Unknown reconstruction_metric: '{reconstruction_metric}'. "
-            )
+            raise ValueError(f"Unknown reconstruction_metric: '{reconstruction_metric}'. ")
 
         # Handle infinite error (no observed voxels or empty reconstruction)
         if np.isinf(error):
@@ -328,10 +328,27 @@ class Reconstruct3D(ManipulationEnv):
             # Convert error to reward: reward = reward_scale * exp(-error/characteristic_error)
             reward = self.reward_scale * np.exp(-error / self.characteristic_error)
 
+        # Apply action penalty
+        reward -= self.compute_action_penalty(action)
+
         if output_error:
             return reward, error
         else:
             return reward
+
+    def compute_action_penalty(self, action):
+        """
+        Compute the penalty for large actions (torques, velocities, deltas, etc.).
+
+        Args:
+            action (np.ndarray): The action taken by the robot.
+
+        Returns:
+            float: The computed penalty.
+        """
+        if action is None or self.action_penalty_scale == 0.0:
+            return 0.0
+        return self.action_penalty_scale * np.sum(np.square(action))
 
     def compute_chamfer_distance(self, recon_vertices, recon_faces, n_samples=10000):
         """
@@ -496,10 +513,10 @@ class Reconstruct3D(ManipulationEnv):
             # Clamp ground truth to truncation range for fair comparison
             # sdf_should_observed = np.clip(sdf_should_observed, -truncation_distance, truncation_distance)
 
-            # Compute squared error on observed 
+            # Compute squared error on observed
             diff = np.abs(sdf_is_observed - sdf_should_observed)
             mean_diff_power = np.mean(np.power(diff, power))
-            observed_error = np.power(mean_diff_power, 1/power)
+            observed_error = np.power(mean_diff_power, 1 / power)
         else:
             observed_error = 0.0
 
@@ -507,13 +524,15 @@ class Reconstruct3D(ManipulationEnv):
         # Identify voxels that should have been observed (GT SDF within alpha * truncation_distance)
         should_observe_mask = np.abs(sdf_should) < (alpha * truncation_distance)
         n_should_observe = should_observe_mask.sum()
-        
+
         # Count voxels that should have been observed but weren't
         n_missing = (should_observe_mask & ~observed_mask).sum()
 
-        missing_penalty = (n_missing / n_should_observe) * unobserved_penalty # TODO: make independent of SDF size
+        missing_penalty = (n_missing / n_should_observe) * unobserved_penalty  # TODO: make independent of SDF size
 
-        print(f"Voxelwise TSDF Error Computation: Observed Voxels = {n_observed}, Should Observe = {n_should_observe}, Missing = {n_missing}, Observed Error = {observed_error:.6f}, Missing Penalty = {missing_penalty:.6f}")
+        print(
+            f"Voxelwise TSDF Error Computation: Observed Voxels = {n_observed}, Should Observe = {n_should_observe}, Missing = {n_missing}, Observed Error = {observed_error:.6f}, Missing Penalty = {missing_penalty:.6f}"
+        )
 
         return observed_error + missing_penalty
 
