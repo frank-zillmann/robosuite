@@ -293,36 +293,28 @@ class Reconstruct3D(ManipulationEnv):
             return None
 
         # Compute error based on metric
+        reward_info_dict = {}
         if reconstruction_metric == "chamfer_distance":
             vertices, faces = reconstruction
 
-            assert isinstance(vertices, np.ndarray), "Reconstruction vertices must be a numpy array"
-            assert isinstance(faces, np.ndarray), "Reconstruction faces must be a numpy array"
-
             # Handle empty mesh (no observations yet - expected during early training)
             if len(vertices) == 0:
-                if output_error:
-                    return 0.0, float("inf")  # Minimum reward, infinite error for empty reconstruction
-                else:
-                    return 0.0  # Minimum reward for empty reconstruction
+                error = float("inf")
+            else:
+                # Compute Chamfer distance between reconstructed mesh and ground truth mesh
+                error = self.compute_chamfer_distance(vertices, faces)
 
-            assert (
-                vertices.ndim == 2 and vertices.shape[1] == 3
-            ), f"Reconstruction vertices must have shape (N, 3), got {vertices.shape}"
-            assert (
-                faces.ndim == 2 and faces.shape[1] == 3
-            ), f"Reconstruction faces must have shape (M, 3), got {faces.shape}"
-
-            # Compute Chamfer distance between reconstructed mesh and ground truth mesh
-            error = self.compute_chamfer_distance(vertices, faces)
+            reward_info_dict["chamfer_distance"] = error
 
         elif reconstruction_metric == "voxelwise_tsdf_error":
             # Unpack (sdf_grid, weights_grid) tuple
             sdf_grid, weights_grid = reconstruction
-            error = self.compute_voxelwise_tsdf_error(
+            error, components = self.compute_voxelwise_tsdf_error(
                 sdf_grid,
                 truncation_distance=truncation_distance,
             )
+            reward_info_dict.update(components)
+            reward_info_dict["voxelwise_tsdf_error"] = error
 
         else:
             raise ValueError(f"Unknown reconstruction_metric: '{reconstruction_metric}'. ")
@@ -335,10 +327,14 @@ class Reconstruct3D(ManipulationEnv):
             reward = self.reward_scale * np.exp(-error / self.characteristic_error)
 
         # Apply action penalty
-        reward -= self.compute_action_penalty(action)
+        action_penalty = self.compute_action_penalty(action)
+        reward -= action_penalty
+        reward_info_dict["action_penalty"] = action_penalty
+        reward_info_dict["total_error"] = error
+        reward_info_dict["reward"] = reward
 
         if output_error:
-            return reward, error
+            return reward, reward_info_dict
         else:
             return reward
 
@@ -545,7 +541,15 @@ class Reconstruct3D(ManipulationEnv):
             f"Voxelwise TSDF Error Computation: Observed Voxels = {n_observed}, Should Observe = {n_should_observe}, Missing = {n_missing}, Observed Error = {observed_error:.6f}, Missing Penalty = {missing_penalty:.6f}"
         )
 
-        return observed_error + missing_penalty
+        error_components = {
+            "observed_error": observed_error,
+            "missing_penalty": missing_penalty,
+            "n_observed": n_observed,
+            "n_should_observe": n_should_observe,
+            "n_missing": n_missing,
+        }
+
+        return observed_error + missing_penalty, error_components
 
     def compute_static_env_sdf(self, geom_groups=[0]):
         """
