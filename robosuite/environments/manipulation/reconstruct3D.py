@@ -149,6 +149,10 @@ class Reconstruct3D(ManipulationEnv):
 
         characteristic_error (float): Characteristic error value used for normalizing the reward function: reward_scale * exp(-error/characteristic_error)
 
+        action_penalty_scale (float): Scale factor for action penalty term in reward function.
+
+        norm_exponent (float): Exponent to raise absolute difference to and its corresponding root of the sum when computing reconstruction errors. Default is 2 for L2-norm.
+
     Raises:
         AssertionError: [Invalid number of robots specified]
     """
@@ -174,7 +178,7 @@ class Reconstruct3D(ManipulationEnv):
         render_gpu_device_id=-1,
         control_freq=5,
         lite_physics=True,
-        horizon=50,
+        horizon=40,
         ignore_done=True,
         hard_reset=False,
         camera_names="robot0_eye_in_hand",
@@ -191,6 +195,7 @@ class Reconstruct3D(ManipulationEnv):
         reward_scale=1.0,
         characteristic_error=0.01,
         action_penalty_scale=0.0,
+        norm_exponent=2,
     ):
         # settings for table top
         self.table_full_size = table_full_size
@@ -218,6 +223,7 @@ class Reconstruct3D(ManipulationEnv):
         self.reward_scale = reward_scale
         self.characteristic_error = characteristic_error
         self.action_penalty_scale = action_penalty_scale
+        self.norm_exponent = norm_exponent
 
         super().__init__(
             robots=robots,
@@ -390,7 +396,14 @@ class Reconstruct3D(ManipulationEnv):
         dist_gt_to_recon, _ = recon_tree.query(gt_points, k=1)
 
         # Chamfer distance is the mean of squared distances in both directions
-        chamfer_dist = (np.mean(dist_recon_to_gt**2) + np.mean(dist_gt_to_recon**2)) / 2
+        chamfer_dist = np.power(
+            0.5
+            * (
+                np.mean(np.power(dist_recon_to_gt, self.norm_exponent))
+                + np.mean(np.power(dist_gt_to_recon, self.norm_exponent))
+            ),
+            1 / self.norm_exponent,
+        )
 
         return chamfer_dist
 
@@ -452,9 +465,8 @@ class Reconstruct3D(ManipulationEnv):
         self,
         input_sdf,
         truncation_distance: float,
-        alpha=0.8,
-        unobserved_penalty=1.0,
-        power=2,
+        missing_voxel_truncation_factor=0.8,
+        missing_voxel_penalty=1.0,
         unobserved_threshold=90.0,
     ):
         """
@@ -465,18 +477,17 @@ class Reconstruct3D(ManipulationEnv):
         2. For voxels that should have been observed but weren't: fixed penalty
 
         A voxel "should have been observed" if its ground truth SDF is within
-        alpha * truncation_distance (i.e., it's near the surface).
+        missing_voxel_truncation_factor * truncation_distance (i.e., it's near the surface).
 
         Args:
             input_sdf (np.ndarray): Input TSDF grid to compare against ground truth.
                 Must have the same shape as self.sdf_grid.
             truncation_distance (float): The truncation distance used by the TSDF (in meters).
-            alpha (float): Fraction of truncation_distance within which voxels are expected
-                to be observed. Voxels with |GT SDF| < alpha * truncation_distance should
+            missing_voxel_truncation_factor (float): Fraction of truncation_distance within which voxels are expected
+                to be observed. Voxels with |GT SDF| < missing_voxel_truncation_factor * truncation_distance should
                 have been observed. Default 0.8.
-            unobserved_penalty (float): Fixed penalty added for the fraction of missing voxels
+            missing_voxel_penalty (float): Fixed penalty added for the fraction of missing voxels
                 that should have been observed. Default 1.0.
-            power (float): Power to raise absolute difference to. Default 2 (squared error).
             unobserved_threshold (float): Threshold above which TSDF values are considered
                 unobserved (sentinel value). Default 90.0.
 
@@ -515,20 +526,20 @@ class Reconstruct3D(ManipulationEnv):
 
             # Compute squared error on observed
             diff = np.abs(sdf_is_observed - sdf_should_observed)
-            mean_diff_power = np.mean(np.power(diff, power))
-            observed_error = np.power(mean_diff_power, 1 / power)
+            mean_diff_norm_exponent = np.mean(np.power(diff, self.norm_exponent))
+            observed_error = np.power(mean_diff_norm_exponent, 1 / self.norm_exponent)
         else:
             observed_error = 0.0
 
         # Part 2: Add penalty for missing observations
-        # Identify voxels that should have been observed (GT SDF within alpha * truncation_distance)
-        should_observe_mask = np.abs(sdf_should) < (alpha * truncation_distance)
+        # Identify voxels that should have been observed (GT SDF within missing_voxel_truncation_factor * truncation_distance)
+        should_observe_mask = np.abs(sdf_should) < (missing_voxel_truncation_factor * truncation_distance)
         n_should_observe = should_observe_mask.sum()
 
         # Count voxels that should have been observed but weren't
         n_missing = (should_observe_mask & ~observed_mask).sum()
 
-        missing_penalty = (n_missing / n_should_observe) * unobserved_penalty  # TODO: make independent of SDF size
+        missing_penalty = (n_missing / n_should_observe) * missing_voxel_penalty  # TODO: make independent of SDF size
 
         print(
             f"Voxelwise TSDF Error Computation: Observed Voxels = {n_observed}, Should Observe = {n_should_observe}, Missing = {n_missing}, Observed Error = {observed_error:.6f}, Missing Penalty = {missing_penalty:.6f}"
