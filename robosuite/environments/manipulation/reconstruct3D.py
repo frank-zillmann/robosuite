@@ -193,7 +193,7 @@ class Reconstruct3D(ManipulationEnv):
         sdf_size=32,
         sdf_padding=0.05,
         reward_scale=1.0,
-        characteristic_error=0.01,
+        characteristic_error=1.0,
         action_penalty_scale=0.0,
         norm_exponent=2,
     ):
@@ -224,6 +224,7 @@ class Reconstruct3D(ManipulationEnv):
         self.characteristic_error = characteristic_error
         self.action_penalty_scale = action_penalty_scale
         self.norm_exponent = norm_exponent
+        self.cached_error = None
 
         super().__init__(
             robots=robots,
@@ -300,6 +301,7 @@ class Reconstruct3D(ManipulationEnv):
             # Handle empty mesh (no observations yet - expected during early training)
             if len(vertices) == 0:
                 error = float("inf")
+                print(f"[Reconstruct3D] Empty reconstruction mesh detected in step {self.timestep}. Assigning infinite Chamfer distance error.")
             else:
                 # Compute Chamfer distance between reconstructed mesh and ground truth mesh
                 error = self.compute_chamfer_distance(vertices, faces)
@@ -327,10 +329,10 @@ class Reconstruct3D(ManipulationEnv):
             reward = self.reward_scale * np.exp(-error / self.characteristic_error)
 
         # Apply action penalty
+        reward_info_dict["pre_action_penalty_reward"] = reward
         action_penalty = self.compute_action_penalty(action)
         reward -= action_penalty
         reward_info_dict["action_penalty"] = action_penalty
-        reward_info_dict["total_error"] = error
         reward_info_dict["reward"] = reward
 
         if output_error:
@@ -526,6 +528,7 @@ class Reconstruct3D(ManipulationEnv):
             observed_error = np.power(mean_diff_norm_exponent, 1 / self.norm_exponent)
         else:
             observed_error = 0.0
+            print(f"[Reconstruct3D] No observed voxels detected in step {self.timestep}. Assigning voxelwise TSDF error to 1.0.")
 
         # Part 2: Add penalty for missing observations
         # Identify voxels that should have been observed (GT SDF within missing_voxel_truncation_factor * truncation_distance)
@@ -535,21 +538,17 @@ class Reconstruct3D(ManipulationEnv):
         # Count voxels that should have been observed but weren't
         n_missing = (should_observe_mask & ~observed_mask).sum()
 
-        missing_penalty = (n_missing / n_should_observe) * missing_voxel_penalty  # TODO: make independent of SDF size
-
-        print(
-            f"Voxelwise TSDF Error Computation: Observed Voxels = {n_observed}, Should Observe = {n_should_observe}, Missing = {n_missing}, Observed Error = {observed_error:.6f}, Missing Penalty = {missing_penalty:.6f}"
-        )
+        missing_error = (n_missing / n_should_observe) * missing_voxel_penalty if n_should_observe > 0 else 0.0
 
         error_components = {
             "observed_error": observed_error,
-            "missing_penalty": missing_penalty,
+            "missing_error": missing_error,
             "n_observed": n_observed,
             "n_should_observe": n_should_observe,
             "n_missing": n_missing,
         }
 
-        return observed_error + missing_penalty, error_components
+        return observed_error + missing_error, error_components
 
     def compute_static_env_sdf(self, geom_groups=[0]):
         """
