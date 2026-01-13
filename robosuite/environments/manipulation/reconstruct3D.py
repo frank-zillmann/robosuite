@@ -142,7 +142,7 @@ class Reconstruct3D(ManipulationEnv):
         sdf_size (int): Resolution of the SDF grid (default 32). The SDF will be computed on a cubic grid
             of shape (sdf_size, sdf_size, sdf_size).
 
-        sdf_padding (float): Padding ratio for the SDF bounding box (default 0.05 = 5% padding on each side).
+        bbox_padding (float): Padding ratio for the SDF bounding box (default 0.05 = 5% padding on each side).
             This ensures surfaces at boundaries are not cut off.
 
         reward_scale (float): Scales the normalized reward function by the amount specified. reward_scale = maximum possible reward.
@@ -191,7 +191,7 @@ class Reconstruct3D(ManipulationEnv):
         seed=None,
         # SDF-related parameters
         sdf_size=32,
-        sdf_padding=0.05,
+        bbox_padding=0.05,
         reward_scale=1.0,
         characteristic_error=1.0,
         action_penalty_scale=0.0,
@@ -211,13 +211,13 @@ class Reconstruct3D(ManipulationEnv):
         # static env mesh related variables (initialized to None, computed via compute_static_env_mesh)
         self.static_env_vertices = None
         self.static_env_faces = None
+        self.bbox_padding = bbox_padding
+        self.bbox_center = None
+        self.bbox_size = None
 
         # SDF-related object variables (initialized to None, computed via compute_static_env_sdf)
         self.sdf_grid = None
-        self.sdf_bbox_center = None
-        self.sdf_bbox_size = None
         self.sdf_size = sdf_size
-        self.sdf_padding = sdf_padding
 
         # Reward scaling and penalties
         self.reward_scale = reward_scale
@@ -301,7 +301,9 @@ class Reconstruct3D(ManipulationEnv):
             # Handle empty mesh (no observations yet - expected during early training)
             if len(vertices) == 0:
                 error = float("inf")
-                print(f"[Reconstruct3D] Empty reconstruction mesh detected in step {self.timestep}. Assigning infinite Chamfer distance error.")
+                print(
+                    f"[Reconstruct3D] Empty reconstruction mesh detected in step {self.timestep}. Assigning infinite Chamfer distance error."
+                )
             else:
                 # Compute Chamfer distance between reconstructed mesh and ground truth mesh
                 error = self.compute_chamfer_distance(vertices, faces)
@@ -463,7 +465,7 @@ class Reconstruct3D(ManipulationEnv):
         self,
         input_sdf,
         truncation_distance: float,
-        missing_voxel_truncation_factor=0.8,
+        missing_voxel_truncation_factor=0.5,
         missing_voxel_penalty=1.0,
         unobserved_threshold=90.0,
     ):
@@ -528,7 +530,9 @@ class Reconstruct3D(ManipulationEnv):
             observed_error = np.power(mean_diff_norm_exponent, 1 / self.norm_exponent)
         else:
             observed_error = 0.0
-            print(f"[Reconstruct3D] No observed voxels detected in step {self.timestep}. Assigning voxelwise TSDF error to 1.0.")
+            print(
+                f"[Reconstruct3D] No observed voxels detected in step {self.timestep}. Assigning voxelwise TSDF error to 1.0."
+            )
 
         # Part 2: Add penalty for missing observations
         # Identify voxels that should have been observed (GT SDF within missing_voxel_truncation_factor * truncation_distance)
@@ -571,27 +575,13 @@ class Reconstruct3D(ManipulationEnv):
 
         vertices, faces = self.compute_static_env_mesh(geom_groups=geom_groups)
 
-        # Compute bounding box
-        bbox_min = vertices.min(axis=0)
-        bbox_max = vertices.max(axis=0)
-        bbox_center = (bbox_min + bbox_max) / 2
-        bbox_size = (bbox_max - bbox_min).max()
-
-        # Add padding to bounding box to avoid cutting off surfaces at boundaries
-        bbox_size = bbox_size * (1 + 2 * self.sdf_padding)
-
         # Normalize vertices to [-1, 1] for mesh2sdf
-        vertices_normalized = (vertices - bbox_center) / (bbox_size / 2)
+        vertices_normalized = (vertices - self.bbox_center) / (self.bbox_size / 2)
 
         # Convert to SDF using mesh2sdf
-        sdf_grid = mesh2sdf.compute(vertices_normalized, faces, size=self.sdf_size, fix=False, return_mesh=False)
+        self.sdf_grid = mesh2sdf.compute(vertices_normalized, faces, size=self.sdf_size, fix=False, return_mesh=False)
 
-        # Store results in object variables
-        self.sdf_grid = sdf_grid
-        self.sdf_bbox_center = bbox_center
-        self.sdf_bbox_size = bbox_size
-
-        return self.sdf_grid, self.sdf_bbox_center, self.sdf_bbox_size
+        return self.sdf_grid, self.bbox_center, self.bbox_size
 
     def compute_static_env_mesh(self, geom_groups=None, exclude_table_legs=True):
         """
@@ -687,6 +677,13 @@ class Reconstruct3D(ManipulationEnv):
         # Combine all meshes
         self.static_env_vertices = np.vstack(all_vertices) if all_vertices else np.zeros((0, 3))
         self.static_env_faces = np.vstack(all_faces) if all_faces else np.zeros((0, 3), dtype=np.int32)
+
+        # Compute bounding box
+        bbox_min = self.static_env_vertices.min(axis=0)
+        bbox_max = self.static_env_vertices.max(axis=0)
+        self.bbox_center = (bbox_min + bbox_max) / 2
+        # Add padding to bounding box to avoid cutting off surfaces at boundaries
+        self.bbox_size = (bbox_max - bbox_min).max() * (1 + 2 * self.bbox_padding)
 
         return self.static_env_vertices, self.static_env_faces
 
