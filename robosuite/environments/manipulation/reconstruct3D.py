@@ -274,7 +274,7 @@ class Reconstruct3D(ManipulationEnv):
         is equal to reward_scale (when error is 0).
 
         Args:
-            action (np array): [NOT USED] Robot action for compatibility with robosuite API
+            action (np array): Robot action for action penalty computation.
             reconstruction: The reconstruction data. Type depends on reconstruction_metric:
                 - For "chamfer_distance": tuple (vertices, faces) where vertices is (N, 3) and faces is (M, 3)
                 - For "voxelwise_tsdf_error": numpy array of shape (sdf_size, sdf_size, sdf_size)
