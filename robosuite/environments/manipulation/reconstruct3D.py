@@ -176,7 +176,7 @@ class Reconstruct3D(ManipulationEnv):
         render_collision_mesh=False,
         render_visual_mesh=True,
         render_gpu_device_id=-1,
-        control_freq=5,
+        control_freq=4,
         lite_physics=True,
         horizon=40,
         ignore_done=True,
