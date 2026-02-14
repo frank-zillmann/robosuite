@@ -512,6 +512,7 @@ class Reconstruct3D(ManipulationEnv):
 
         sdf_is = input_sdf
         sdf_should = self.sdf_grid
+        error_components = {}
 
         # Identify observed voxels (TSDF values below sentinel threshold)
         observed_mask = np.abs(sdf_is) < unobserved_threshold
@@ -529,6 +530,13 @@ class Reconstruct3D(ManipulationEnv):
             diff = np.abs(sdf_is_observed - sdf_should_observed)
             mean_diff_norm_exponent = np.mean(np.power(diff, self.norm_exponent))
             observed_error = np.power(mean_diff_norm_exponent, 1 / self.norm_exponent)
+
+            # write statistics about diff to error components
+            error_components["observed_diff_mean"] = np.mean(diff)
+            error_components["observed_diff_std"] = np.std(diff)
+            error_components["observed_diff_max"] = np.max(diff)
+            error_components["observed_diff_min"] = np.min(diff)
+
         else:
             observed_error = 0.0
             print(
@@ -545,13 +553,11 @@ class Reconstruct3D(ManipulationEnv):
 
         missing_error = (n_missing / n_should_observe) * missing_voxel_penalty if n_should_observe > 0 else 0.0
 
-        error_components = {
-            "observed_error": observed_error,
-            "missing_error": missing_error,
-            "n_observed": n_observed,
-            "n_should_observe": n_should_observe,
-            "n_missing": n_missing,
-        }
+        error_components["observed_error"] = observed_error
+        error_components["missing_error"] = missing_error
+        error_components["n_observed"] = n_observed
+        error_components["n_should_observe"] = n_should_observe
+        error_components["n_missing"] = n_missing
 
         return observed_error + missing_error, error_components
 
@@ -579,8 +585,11 @@ class Reconstruct3D(ManipulationEnv):
         # Normalize vertices to [-1, 1] for mesh2sdf
         vertices_normalized = (vertices - self.bbox_center) / (self.bbox_size / 2)
 
-        # Convert to SDF using mesh2sdf
-        self.sdf_grid = mesh2sdf.compute(vertices_normalized, faces, size=self.sdf_size, fix=False, return_mesh=False)
+        # Convert to SDF using mesh2sdf (returns values in normalized [-1, 1] space)
+        sdf_normalized = mesh2sdf.compute(vertices_normalized, faces, size=self.sdf_size, fix=False, return_mesh=False)
+
+        # Convert SDF values back to world units (meters)
+        self.sdf_grid = sdf_normalized * (self.bbox_size / 2)
 
         return self.sdf_grid, self.bbox_center, self.bbox_size
 
