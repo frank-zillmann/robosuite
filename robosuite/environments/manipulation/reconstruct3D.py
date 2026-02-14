@@ -531,8 +531,6 @@ class Reconstruct3D(ManipulationEnv):
             observed_error = np.power(mean_diff_norm_exponent, 1 / norm_exponent)
 
             # write statistics about diff to error components
-            error_components["observed_diff_mean"] = np.mean(diff)
-            error_components["observed_diff_std"] = np.std(diff)
             error_components["observed_diff_max"] = np.max(diff)
             error_components["observed_diff_min"] = np.min(diff)
 
