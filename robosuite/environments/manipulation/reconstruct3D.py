@@ -145,12 +145,6 @@ class Reconstruct3D(ManipulationEnv):
         bbox_padding (float): Padding ratio for the SDF bounding box (default 0.05 = 5% padding on each side).
             This ensures surfaces at boundaries are not cut off.
 
-        reward_scale (float): Scales the normalized reward function by the amount specified. reward_scale = maximum possible reward.
-
-        characteristic_error (float): Characteristic error value used for normalizing the reward function: reward_scale * exp(-error/characteristic_error)
-
-        action_penalty_scale (float): Scale factor for action penalty term in reward function.
-
         norm_exponent (float): Exponent to raise absolute difference to and its corresponding root of the sum when computing reconstruction errors. Default is 2 for L2-norm.
 
     Raises:
@@ -192,9 +186,6 @@ class Reconstruct3D(ManipulationEnv):
         # SDF-related parameters
         sdf_size=32,
         bbox_padding=0.05,
-        reward_scale=1.0,
-        characteristic_error=1.0,
-        action_penalty_scale=0.0,
         norm_exponent=2,
     ):
         # settings for table top
@@ -219,10 +210,7 @@ class Reconstruct3D(ManipulationEnv):
         self.sdf_grid = None
         self.sdf_size = sdf_size
 
-        # Reward scaling and penalties
-        self.reward_scale = reward_scale
-        self.characteristic_error = characteristic_error
-        self.action_penalty_scale = action_penalty_scale
+        # Reward parameters
         self.norm_exponent = norm_exponent
         self.cached_error = None
 
@@ -261,31 +249,31 @@ class Reconstruct3D(ManipulationEnv):
         reconstruction=None,
         reconstruction_metric=None,
         truncation_distance=None,
+        reward_mode=None,
+        reward_scale=1.0,
+        characteristic_error=1.0,
+        action_penalty_scale=0.0,
         output_info_dict=False,
     ):
         """
         Reward function for the 3D reconstruction task.
 
-        The reward is based on the reconstruction error (Chamfer distance or SDF error)
-        between the reconstructed and ground truth representations.
-        Lower reconstruction error yields higher reward.
-
-        Note that the final reward is normalized and scaled by reward_scale so that the max score
-        is equal to reward_scale (when error is 0).
-
         Args:
             action (np array): Robot action for action penalty computation.
             reconstruction: The reconstruction data. Type depends on reconstruction_metric:
-                - For "chamfer_distance": tuple (vertices, faces) where vertices is (N, 3) and faces is (M, 3)
+                - For "chamfer_distance": tuple (vertices, faces)
                 - For "voxelwise_tsdf_error": numpy array of shape (sdf_size, sdf_size, sdf_size)
-            reconstruction_metric (str): The metric to use for reward computation.
-                Must be one of: "chamfer_distance", "voxelwise_tsdf_error".
-            truncation_distance (float): TSDF truncation distance in meters. Used for SDF error.
-            output_error (bool): If True, also return the raw error value.
+            reconstruction_metric (str): "chamfer_distance" or "voxelwise_tsdf_error".
+            truncation_distance (float): TSDF truncation distance in meters.
+            output_info_dict (bool): If True, also return the info dict.
+            reward_mode (str): "exponential" or "delta".
+            reward_scale (float): Scales the reward.
+            characteristic_error (float): Normalizes the error in reward computation.
+            action_penalty_scale (float): Scales the action penalty term in the reward.
 
         Returns:
-            float: reward value (higher is better, max is reward_scale when error is 0)
-            If output_error=True, returns tuple (reward, error)
+            float: reward value
+            If output_info_dict=True, returns tuple (reward, info_dict)
         """
         if reconstruction is None:
             # This happens when reward() is called automatically by the parent step() method
@@ -323,16 +311,25 @@ class Reconstruct3D(ManipulationEnv):
         else:
             raise ValueError(f"Unknown reconstruction_metric: '{reconstruction_metric}'. ")
 
-        # Handle infinite error (no observed voxels or empty reconstruction)
-        if np.isinf(error):
-            reward = 0.0
+        # Compute reward based on mode
+        if reward_mode == "exponential":
+            reward = reward_scale * np.exp(-error / characteristic_error)
+        elif reward_mode == "delta":
+            if self.cached_error is None:
+                if reconstruction_metric == "chamfer_distance":
+                    self.cached_error = error  # No reward at first step
+                if reconstruction_metric == "voxelwise_tsdf_error":
+                    self.cached_error = 1.0  # 1.0 as default error, corresponds to all missing but no distance error
+
+            reward = reward_scale * (self.cached_error - error) / characteristic_error
         else:
-            # Convert error to reward: reward = reward_scale * exp(-error/characteristic_error)
-            reward = self.reward_scale * np.exp(-error / self.characteristic_error)
+            raise ValueError(f"Unknown reward_mode: '{reward_mode}'. Use 'exponential' or 'delta'.")
+
+        self.cached_error = error
 
         # Apply action penalty
         info_dict["pre_action_penalty_reward"] = reward
-        action_penalty = self.compute_action_penalty(action)
+        action_penalty = self.compute_action_penalty(action, action_penalty_scale=action_penalty_scale)
         reward -= action_penalty
         info_dict["action_penalty"] = action_penalty
         info_dict["reward"] = reward
@@ -342,7 +339,7 @@ class Reconstruct3D(ManipulationEnv):
         else:
             return reward
 
-    def compute_action_penalty(self, action):
+    def compute_action_penalty(self, action, action_penalty_scale):
         """
         Compute the penalty for large actions (torques, velocities, deltas, etc.).
 
@@ -352,9 +349,13 @@ class Reconstruct3D(ManipulationEnv):
         Returns:
             float: The computed penalty.
         """
-        if action is None or self.action_penalty_scale == 0.0:
+        if action is None or action_penalty_scale == 0.0:
             return 0.0
-        return self.action_penalty_scale * np.sum(np.square(action))
+
+        # Normalize by action dimension to keep penalty scale consistent across different action spaces
+        # penealty = action_penalty_scale * np.linalg.norm(action, ord=2) // np.sqrt(len(action))
+
+        return action_penalty_scale * np.mean(np.abs(action))
 
     def compute_chamfer_distance(self, recon_vertices, recon_faces, n_samples=10000):
         """
@@ -813,6 +814,7 @@ class Reconstruct3D(ManipulationEnv):
         Resets simulation internal configurations.
         """
         super()._reset_internal()
+        self.cached_error = None
 
         # Reset all object positions using initializer sampler if we're not directly loading from an xml
         if not self.deterministic_reset:
