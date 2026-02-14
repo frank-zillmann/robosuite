@@ -145,8 +145,6 @@ class Reconstruct3D(ManipulationEnv):
         bbox_padding (float): Padding ratio for the SDF bounding box (default 0.05 = 5% padding on each side).
             This ensures surfaces at boundaries are not cut off.
 
-        norm_exponent (float): Exponent to raise absolute difference to and its corresponding root of the sum when computing reconstruction errors. Default is 2 for L2-norm.
-
     Raises:
         AssertionError: [Invalid number of robots specified]
     """
@@ -186,7 +184,6 @@ class Reconstruct3D(ManipulationEnv):
         # SDF-related parameters
         sdf_size=32,
         bbox_padding=0.05,
-        norm_exponent=2,
     ):
         # settings for table top
         self.table_full_size = table_full_size
@@ -210,8 +207,6 @@ class Reconstruct3D(ManipulationEnv):
         self.sdf_grid = None
         self.sdf_size = sdf_size
 
-        # Reward parameters
-        self.norm_exponent = norm_exponent
         self.cached_error = None
 
         super().__init__(
@@ -397,13 +392,11 @@ class Reconstruct3D(ManipulationEnv):
         dist_gt_to_recon, _ = recon_tree.query(gt_points, k=1)
 
         # Chamfer distance is the mean of squared distances in both directions
+        norm_exponent = 1  # L1 norm
         chamfer_dist = np.power(
             0.5
-            * (
-                np.mean(np.power(dist_recon_to_gt, self.norm_exponent))
-                + np.mean(np.power(dist_gt_to_recon, self.norm_exponent))
-            ),
-            1 / self.norm_exponent,
+            * (np.mean(np.power(dist_recon_to_gt, norm_exponent)) + np.mean(np.power(dist_gt_to_recon, norm_exponent))),
+            1 / norm_exponent,
         )
 
         return chamfer_dist
@@ -528,8 +521,10 @@ class Reconstruct3D(ManipulationEnv):
 
             # Compute squared error on observed
             diff = np.abs(sdf_is_observed - sdf_should_observed)
-            mean_diff_norm_exponent = np.mean(np.power(diff, self.norm_exponent))
-            observed_error = np.power(mean_diff_norm_exponent, 1 / self.norm_exponent)
+
+            norm_exponent = 1  # L1 norm
+            mean_diff_norm_exponent = np.mean(np.power(diff, norm_exponent))
+            observed_error = np.power(mean_diff_norm_exponent, 1 / norm_exponent)
 
             # write statistics about diff to error components
             error_components["observed_diff_mean"] = np.mean(diff)
