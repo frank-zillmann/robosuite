@@ -311,6 +311,10 @@ class Reconstruct3D(ManipulationEnv):
             reward = reward_scale * np.exp(-error / characteristic_error)
         elif reward_mode == "delta":
             if self.cached_error is None:
+                if self.timestep > 0:
+                    print(
+                        f"[Reconstruct3D] Warning: No cached error found in step {self.timestep} > 0 (should not happen)."
+                    )
                 if reconstruction_metric == "chamfer_distance":
                     self.cached_error = error  # No reward at first step
                 if reconstruction_metric == "voxelwise_tsdf_error":
