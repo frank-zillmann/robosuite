@@ -261,7 +261,7 @@ class Reconstruct3D(ManipulationEnv):
         reconstruction=None,
         reconstruction_metric=None,
         truncation_distance=None,
-        output_error=False,
+        output_info_dict=False,
     ):
         """
         Reward function for the 3D reconstruction task.
@@ -294,7 +294,7 @@ class Reconstruct3D(ManipulationEnv):
             return None
 
         # Compute error based on metric
-        reward_info_dict = {}
+        info_dict = {}
         if reconstruction_metric == "chamfer_distance":
             vertices, faces = reconstruction
 
@@ -308,7 +308,7 @@ class Reconstruct3D(ManipulationEnv):
                 # Compute Chamfer distance between reconstructed mesh and ground truth mesh
                 error = self.compute_chamfer_distance(vertices, faces)
 
-            reward_info_dict["chamfer_distance"] = error
+            info_dict["chamfer_distance"] = error
 
         elif reconstruction_metric == "voxelwise_tsdf_error":
             # Unpack (sdf_grid, weights_grid) tuple
@@ -317,8 +317,8 @@ class Reconstruct3D(ManipulationEnv):
                 sdf_grid,
                 truncation_distance=truncation_distance,
             )
-            reward_info_dict.update(components)
-            reward_info_dict["voxelwise_tsdf_error"] = error
+            info_dict.update(components)
+            info_dict["voxelwise_tsdf_error"] = error
 
         else:
             raise ValueError(f"Unknown reconstruction_metric: '{reconstruction_metric}'. ")
@@ -331,14 +331,14 @@ class Reconstruct3D(ManipulationEnv):
             reward = self.reward_scale * np.exp(-error / self.characteristic_error)
 
         # Apply action penalty
-        reward_info_dict["pre_action_penalty_reward"] = reward
+        info_dict["pre_action_penalty_reward"] = reward
         action_penalty = self.compute_action_penalty(action)
         reward -= action_penalty
-        reward_info_dict["action_penalty"] = action_penalty
-        reward_info_dict["reward"] = reward
+        info_dict["action_penalty"] = action_penalty
+        info_dict["reward"] = reward
 
-        if output_error:
-            return reward, reward_info_dict
+        if output_info_dict:
+            return reward, info_dict
         else:
             return reward
 
