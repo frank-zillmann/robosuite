@@ -170,7 +170,7 @@ class Reconstruct3D(ManipulationEnv):
         render_gpu_device_id=-1,
         control_freq=4,
         lite_physics=True,
-        horizon=40,
+        horizon=32, # 8 seconds at control_freq=4
         ignore_done=True,
         hard_reset=False,
         camera_names="robot0_eye_in_hand",
