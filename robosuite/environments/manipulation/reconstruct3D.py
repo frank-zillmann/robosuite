@@ -207,6 +207,9 @@ class Reconstruct3D(ManipulationEnv):
         self.sdf_grid = None
         self.sdf_size = sdf_size
 
+        # Table surface z-coordinate (top of table plate)
+        self.table_surface_z = self.table_offset[2] + self.table_full_size[2] / 2
+
         self.cached_error = None
 
         super().__init__(
@@ -463,9 +466,10 @@ class Reconstruct3D(ManipulationEnv):
         self,
         input_sdf,
         truncation_distance: float,
-        missing_voxel_truncation_factor=0.5,
+        truncation_relax_factor=0.5,
         missing_voxel_penalty=1.0,
         unobserved_threshold=90.0,
+        exclude_below_table_surface=True,
     ):
         """
         Compute error between a dense TSDF grid and the stored ground truth SDF.
@@ -481,13 +485,15 @@ class Reconstruct3D(ManipulationEnv):
             input_sdf (np.ndarray): Input TSDF grid to compare against ground truth.
                 Must have the same shape as self.sdf_grid.
             truncation_distance (float): The truncation distance used by the TSDF (in meters).
-            missing_voxel_truncation_factor (float): Fraction of truncation_distance within which voxels are expected
-                to be observed. Voxels with |GT SDF| < missing_voxel_truncation_factor * truncation_distance should
-                have been observed. Default 0.8.
+            truncation_relax_factor (float): Fraction by which truncation_distance is relaxed 
+                when determining which voxels should have been observed.
             missing_voxel_penalty (float): Fixed penalty added for the fraction of missing voxels
                 that should have been observed. Default 1.0.
             unobserved_threshold (float): Threshold above which TSDF values are considered
                 unobserved (sentinel value). Default 90.0.
+            exclude_below_table_surface (bool): If True, exclude voxels below the table top
+                surface from error computation. This prevents penalizing the agent for not
+                observing the underside of the table. Default True.
 
         Returns:
             float: Combined error (MSE on observed + penalty for missing observations).
@@ -511,8 +517,17 @@ class Reconstruct3D(ManipulationEnv):
         sdf_should = self.sdf_grid
         error_components = {}
 
-        # Identify observed voxels (TSDF values below sentinel threshold)
-        observed_mask = np.abs(sdf_is) < unobserved_threshold
+        # Build above-table mask: exclude voxels whose world z-coordinate is below the table surface.
+        if exclude_below_table_surface and self.bbox_center is not None:
+            z_world = self.bbox_center[2] + np.linspace(-self.bbox_size / 2, self.bbox_size / 2, sdf_is.shape[2])
+            above_table_mask = z_world[np.newaxis, np.newaxis, :] >= (self.table_surface_z - truncation_relax_factor * truncation_distance)  # small delte for robustness
+            # Broadcast to full 3D shape for element-wise ops
+            above_table_mask = np.broadcast_to(above_table_mask, sdf_is.shape).copy()
+        else:
+            above_table_mask = np.ones(sdf_is.shape, dtype=bool)
+
+        # Identify observed voxels (TSDF values below sentinel threshold), restricted to above-table region
+        observed_mask = (np.abs(sdf_is) < unobserved_threshold) & above_table_mask
         n_observed = observed_mask.sum()
 
         # Part 1: Compute MSE on observed voxels
@@ -542,7 +557,8 @@ class Reconstruct3D(ManipulationEnv):
 
         # Part 2: Add penalty for missing observations
         # Identify voxels that should have been observed (GT SDF within missing_voxel_truncation_factor * truncation_distance)
-        should_observe_mask = np.abs(sdf_should) < (missing_voxel_truncation_factor * truncation_distance)
+        # Also restricted to above-table region to avoid penalizing for not observing below the table
+        should_observe_mask = (np.abs(sdf_should) < (truncation_relax_factor * truncation_distance)) & above_table_mask
         n_should_observe = should_observe_mask.sum()
 
         # Count voxels that should have been observed but weren't
