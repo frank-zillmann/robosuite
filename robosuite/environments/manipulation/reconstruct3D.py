@@ -11,6 +11,9 @@ from robosuite.utils.observables import Observable, sensor
 from robosuite.utils.placement_samplers import UniformRandomSampler
 from robosuite.utils.transform_utils import convert_quat
 
+# MuJoCo geom group holding the collision geoms (group 1 holds their visual duplicates)
+COLLISION_GEOM_GROUP = 0
+
 
 class Reconstruct3D(ManipulationEnv):
     """
@@ -196,7 +199,7 @@ class Reconstruct3D(ManipulationEnv):
         # object placement initializer
         self.placement_initializer = placement_initializer
 
-        # static env mesh related variables (initialized to None, computed via compute_static_env_mesh)
+        # static env mesh related variables (initialized to None, computed via compute_gt_mesh)
         self.gt_vertices = None
         self.gt_faces = None
 
@@ -403,7 +406,7 @@ class Reconstruct3D(ManipulationEnv):
 
         # Check if ground truth mesh has been computed
         if self.gt_vertices is None or self.gt_faces is None:
-            raise RuntimeError("Ground truth mesh has not been computed yet. Call compute_static_env_mesh() first.")
+            raise RuntimeError("Ground truth mesh has not been computed yet. Call compute_gt_mesh() first.")
 
         # Sample points from both mesh surfaces
         gt_points = self._sample_points_from_mesh(self.gt_vertices, self.gt_faces, n_samples)
@@ -475,12 +478,7 @@ class Reconstruct3D(ManipulationEnv):
 
         # Sample and cache the GT surface point cloud once per episode
         if self.gt_surface_points is None:
-            if self.gt_vertices is None or self.gt_faces is None:
-                raise RuntimeError("Ground truth mesh has not been computed yet. Call compute_static_env_mesh() first.")
-
-            self.gt_surface_points = self._sample_points_from_mesh(
-                self.gt_vertices, self.gt_faces, n_samples, visible_only=True
-            )
+            self.gt_surface_points = self._sample_points_from_mesh(self.gt_vertices, self.gt_faces, n_samples)
             self.gt_covered = np.zeros(len(self.gt_surface_points), dtype=bool)
             self.gt_tree = cKDTree(self.gt_surface_points)
             self.n_recon_consumed = 0
@@ -624,7 +622,7 @@ class Reconstruct3D(ManipulationEnv):
 
         return observed_error + missing_error, error_components
 
-    def compute_static_env_sdf(self, geom_groups=[0]):
+    def compute_static_env_sdf(self):
         """
         Compute SDF from the static environment mesh and store in object variables.
 
@@ -632,9 +630,8 @@ class Reconstruct3D(ManipulationEnv):
         computes the SDF using mesh2sdf, and stores the result along with bounding box
         information for later use.
 
-        Args:
-            geom_groups (list of int, optional): Geom groups to include in mesh extraction.
-                Default: [0] for collision geoms only to avoid duplicates.
+        Note: the GT mesh only contains observable surfaces and is therefore open, so
+        mesh2sdf has no reliable inside/outside — treat the resulting signs with care.
 
         Returns:
             np.ndarray: The computed SDF grid of shape (sdf_size, sdf_size, sdf_size)
@@ -643,7 +640,7 @@ class Reconstruct3D(ManipulationEnv):
         """
         import mesh2sdf
 
-        vertices, faces = self.compute_static_env_mesh(geom_groups=geom_groups)
+        vertices, faces = self.compute_gt_mesh()
 
         # Normalize vertices to [-1, 1] for mesh2sdf
         vertices_normalized = (vertices - self.bbox_center) / (self.bbox_size / 2)
@@ -656,109 +653,96 @@ class Reconstruct3D(ManipulationEnv):
 
         return self.sdf_grid, self.bbox_center, self.bbox_size
 
-    def compute_static_env_mesh(self, geom_groups=None, exclude_table_legs=True):
+    def compute_gt_mesh(self, min_normal_z=-0.1):
         """
-        Extract static environment mesh (table + objects) from MuJoCo simulation.
+        Ground-truth mesh of the static environment (table + objects), and its bounding box.
+
+        Uses only the table's top face and each object's faces except
+        the (near-)downward one it rests on — since only those should be reconstructed.
 
         Args:
-            geom_groups (list of int, optional): Geom groups to include in mesh extraction.
-                Use [0] for collision geoms only to avoid duplicates.
-            exclude_table_legs (bool): If True, exclude table leg geoms (keep only table top).
-                Default is True.
+            min_normal_z (float): An object face is kept if its world normal's z exceeds this.
 
         Returns:
-            tuple: (vertices, faces) where:
-                - vertices: (N, 3) array of vertex positions
-                - faces: (M, 3) array of triangle face indices
+            tuple: (vertices, faces)
         """
-        import mujoco
+        body_names = {obj.root_body for obj in self.primitives_on_table} | {"table"}
 
-        all_vertices = []
-        all_faces = []
-        vertex_offset = 0
-
-        # Get body names for objects we want to include
-        object_body_names = set()
-        for obj in self.primitives_on_table:
-            object_body_names.add(obj.root_body)
-
-        # Add table body (note: body name is "table", not "table_collision")
-        object_body_names.add("table")
-
-        # Normalize geom_groups input
-        if geom_groups is not None:
-            geom_groups = set(geom_groups)
-
-        # Iterate over all geoms to find table and objects
+        all_vertices, all_faces, offset = [], [], 0
         for geom_id in range(self.sim.model.ngeom):
-            geom_type = self.sim.model.geom_type[geom_id]
-            body_id = self.sim.model.geom_bodyid[geom_id]
-            body_name = self.sim.model.body(body_id).name
+            body_name = self.sim.model.body(self.sim.model.geom_bodyid[geom_id]).name
 
-            # Only include table and objects
-            if body_name not in object_body_names:
+            if body_name not in body_names:
+                continue
+            # Every body carries a collision geom (group 0) and a visual duplicate (group 1);
+            # taking only collision geoms avoids double surfaces and drops the table legs,
+            # which exist as visual geoms only.
+            if self.sim.model.geom_group[geom_id] != COLLISION_GEOM_GROUP:
                 continue
 
-            # If geom_groups filter provided, enforce it
-            if geom_groups is not None:
-                geom_group = self.sim.model.geom_group[geom_id]
-                if geom_group not in geom_groups:
-                    continue
+            vertices, faces, normals = self._geom_mesh(geom_id, self.sim.model.geom_type[geom_id])
 
-            # Get geom pose
-            geom_pos = self.sim.data.geom_xpos[geom_id]
+            # To world coordinates (normals only rotate)
             geom_mat = self.sim.data.geom_xmat[geom_id].reshape(3, 3)
+            vertices = vertices @ geom_mat.T + self.sim.data.geom_xpos[geom_id]
+            normal_z = (normals @ geom_mat.T)[:, 2]
 
-            # Exclude table legs: table legs are cylinders (type=5), table top is box (type=6)
-            if exclude_table_legs and body_name == "table" and geom_type == mujoco.mjtGeom.mjGEOM_CYLINDER:
+            # The table is only ever seen from above; objects hide the face they stand on.
+            faces = faces[normal_z > (0.9 if body_name == "table" else min_normal_z)]
+            if len(faces) == 0:
                 continue
 
-            # Handle meshes
-            if geom_type == mujoco.mjtGeom.mjGEOM_MESH:
-                mesh_id = self.sim.model.geom_dataid[geom_id]
-
-                # Extract mesh vertices
-                vert_start = self.sim.model.mesh_vertadr[mesh_id]
-                vert_end = (
-                    self.sim.model.mesh_vertadr[mesh_id + 1]
-                    if mesh_id < self.sim.model.nmesh - 1
-                    else self.sim.model.mesh_vert.shape[0]
-                )
-                vertices = self.sim.model.mesh_vert[vert_start:vert_end].copy()
-
-                # Extract mesh faces
-                face_start = self.sim.model.mesh_faceadr[mesh_id]
-                face_end = (
-                    self.sim.model.mesh_faceadr[mesh_id + 1]
-                    if mesh_id < self.sim.model.nmesh - 1
-                    else self.sim.model.mesh_face.shape[0]
-                )
-                faces = self.sim.model.mesh_face[face_start:face_end].copy()
-
-            else:
-                # Generate mesh for primitive shapes
-                vertices, faces = self._generate_primitive_mesh(geom_type, geom_id)
-
-            # Transform vertices to world coordinates
-            vertices = vertices @ geom_mat.T + geom_pos
-
-            # Add to combined mesh
             all_vertices.append(vertices)
-            all_faces.append(faces + vertex_offset)
-            vertex_offset += len(vertices)
+            all_faces.append(faces + offset)
+            offset += len(vertices)
 
-        # Combine all meshes
-        self.gt_vertices = np.vstack(all_vertices) if all_vertices else np.zeros((0, 3))
-        self.gt_faces = np.vstack(all_faces) if all_faces else np.zeros((0, 3), dtype=np.int32)
+        vertices = np.vstack(all_vertices) if all_vertices else np.zeros((0, 3))
+        faces = np.vstack(all_faces) if all_faces else np.zeros((0, 3), dtype=np.int32)
 
-        # Compute bounding box
-        bbox_min = self.gt_vertices.min(axis=0)
-        bbox_max = self.gt_vertices.max(axis=0)
+        # Drop vertices left unreferenced by the removed faces, so the bounding box below
+        # covers the observable region only
+        if len(faces) > 0:
+            used, faces = np.unique(faces, return_inverse=True)
+            vertices, faces = vertices[used], faces.reshape(-1, 3)
+
+        self.gt_vertices, self.gt_faces = vertices, faces
+
+        # Bounding box, padded to avoid cutting off surfaces at the boundaries
+        bbox_min, bbox_max = vertices.min(axis=0), vertices.max(axis=0)
         self.bbox_center = (bbox_min + bbox_max) / 2
-        # Add padding to bounding box to avoid cutting off surfaces at boundaries
         self.bbox_size = (bbox_max - bbox_min).max() * (1 + 2 * self.bbox_padding)
 
         return self.gt_vertices, self.gt_faces
+
+    def _geom_mesh(self, geom_id, geom_type):
+        """
+        Triangle mesh of a single geom in its local frame.
+
+        Returns:
+            tuple: (vertices, faces, face_normals) with outward normals — `trimesh.creation`
+                primitives are wound outward, imported meshes are re-oriented per closed body.
+        """
+        import mujoco
+        import trimesh
+
+        model = self.sim.model
+        size = model.geom_size[geom_id]
+
+        if geom_type == mujoco.mjtGeom.mjGEOM_BOX:
+            mesh = trimesh.creation.box(extents=2.0 * np.asarray(size[:3]))
+        elif geom_type == mujoco.mjtGeom.mjGEOM_CYLINDER:
+            mesh = trimesh.creation.cylinder(radius=size[0], height=2.0 * size[1], sections=16)
+        elif geom_type == mujoco.mjtGeom.mjGEOM_MESH:
+            mesh_id = model.geom_dataid[geom_id]
+            last = mesh_id >= model.nmesh - 1
+            v0, v1 = model.mesh_vertadr[mesh_id], len(model.mesh_vert) if last else model.mesh_vertadr[mesh_id + 1]
+            f0, f1 = model.mesh_faceadr[mesh_id], len(model.mesh_face) if last else model.mesh_faceadr[mesh_id + 1]
+            mesh = trimesh.Trimesh(model.mesh_vert[v0:v1], model.mesh_face[f0:f1], process=False)
+            mesh.fix_normals()
+        else:
+            raise NotImplementedError(f"Unsupported geom type {geom_type} for mesh extraction.")
+
+        return np.asarray(mesh.vertices), np.asarray(mesh.faces, dtype=np.int32), np.asarray(mesh.face_normals)
 
     def _load_model(self):
         """
@@ -924,89 +908,3 @@ class Reconstruct3D(ManipulationEnv):
         """
         return False
 
-    def _generate_primitive_mesh(self, geom_type, geom_id):
-        """Generate mesh for primitive shapes (box, cylinder, etc.)."""
-        import mujoco
-
-        geom_size = self.sim.model.geom_size[geom_id]
-
-        if geom_type == mujoco.mjtGeom.mjGEOM_BOX:
-            # Box: 8 vertices, 12 triangles
-            sx, sy, sz = geom_size
-            vertices = np.array(
-                [
-                    [-sx, -sy, -sz],
-                    [sx, -sy, -sz],
-                    [sx, sy, -sz],
-                    [-sx, sy, -sz],
-                    [-sx, -sy, sz],
-                    [sx, -sy, sz],
-                    [sx, sy, sz],
-                    [-sx, sy, sz],
-                ]
-            )
-            faces = np.array(
-                [
-                    [0, 1, 2],
-                    [0, 2, 3],
-                    [4, 5, 6],
-                    [4, 6, 7],  # bottom, top
-                    [0, 1, 5],
-                    [0, 5, 4],
-                    [2, 3, 7],
-                    [2, 7, 6],  # front, back
-                    [0, 3, 7],
-                    [0, 7, 4],
-                    [1, 2, 6],
-                    [1, 6, 5],  # left, right
-                ]
-            )
-
-        elif geom_type == mujoco.mjtGeom.mjGEOM_CYLINDER:
-            # Cylinder: approximate with triangular mesh
-            radius, half_height = geom_size[0], geom_size[1]
-            n_segments = 16
-            vertices = []
-            faces = []
-
-            # Generate vertices for cylinder wall
-            # Bottom ring vertices at even indices (0, 2, 4, ...)
-            # Top ring vertices at odd indices (1, 3, 5, ...)
-            for i in range(n_segments):
-                angle = 2 * np.pi * i / n_segments
-                x, y = radius * np.cos(angle), radius * np.sin(angle)
-                vertices.append([x, y, -half_height])  # bottom ring
-                vertices.append([x, y, half_height])  # top ring
-
-            # Add center vertices for caps
-            bottom_center_idx = 2 * n_segments
-            top_center_idx = 2 * n_segments + 1
-            vertices.append([0, 0, -half_height])  # bottom center
-            vertices.append([0, 0, half_height])  # top center
-
-            vertices = np.array(vertices)
-
-            # Generate faces
-            for i in range(n_segments):
-                # Current and next segment indices
-                curr_bottom = 2 * i
-                curr_top = 2 * i + 1
-                next_bottom = 2 * ((i + 1) % n_segments)
-                next_top = 2 * ((i + 1) % n_segments) + 1
-
-                # Side faces (two triangles per segment)
-                faces.append([curr_bottom, next_bottom, curr_top])
-                faces.append([curr_top, next_bottom, next_top])
-
-                # Bottom cap (winding for outward normal pointing -z)
-                faces.append([bottom_center_idx, next_bottom, curr_bottom])
-
-                # Top cap (winding for outward normal pointing +z)
-                faces.append([top_center_idx, curr_top, next_top])
-
-            faces = np.array(faces)
-
-        else:
-            raise NotImplementedError(f"Unsupported geom type {geom_type} for mesh extraction.")
-
-        return vertices, faces
