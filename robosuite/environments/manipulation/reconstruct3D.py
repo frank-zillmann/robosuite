@@ -197,9 +197,16 @@ class Reconstruct3D(ManipulationEnv):
         self.placement_initializer = placement_initializer
 
         # static env mesh related variables (initialized to None, computed via compute_static_env_mesh)
-        self.static_env_vertices = None
-        self.static_env_faces = None
-        self.gt_surface_points = None  # GT surface point cloud (for point_cloud_coverage)
+        self.gt_vertices = None
+        self.gt_faces = None
+
+        # GT surface point cloud + incremental coverage state (for point_cloud_coverage)
+        self.gt_surface_points = None
+        self.gt_covered = None
+        self.gt_tree = None
+        self.n_recon_consumed = 0
+
+        # Bounding box definition for SDF
         self.bbox_padding = bbox_padding
         self.bbox_center = None
         self.bbox_size = None
@@ -253,6 +260,7 @@ class Reconstruct3D(ManipulationEnv):
         characteristic_error=1.0,
         action_penalty_scale=0.0,
         coverage_distance=0.01,
+        coverage_n_samples=50000,
         output_info_dict=False,
     ):
         """
@@ -294,7 +302,7 @@ class Reconstruct3D(ManipulationEnv):
                 )
             else:
                 # Compute Chamfer distance between reconstructed mesh and ground truth mesh
-                error = self.compute_chamfer_distance(vertices, faces)
+                error = self.compute_modified_chamfer_distance(vertices, faces, n_samples=coverage_n_samples)
 
             info_dict["chamfer_distance"] = error
 
@@ -310,7 +318,9 @@ class Reconstruct3D(ManipulationEnv):
 
         elif reconstruction_metric == "point_cloud_coverage":
             error, components = self.compute_point_cloud_coverage_error(
-                recon_points=reconstruction, coverage_distance=coverage_distance
+                recon_points=reconstruction,
+                coverage_distance=coverage_distance,
+                n_samples=coverage_n_samples,
             )
             info_dict.update(components)
             info_dict["point_cloud_coverage_error"] = error
@@ -370,7 +380,7 @@ class Reconstruct3D(ManipulationEnv):
 
         return action_penalty_scale * np.mean(np.abs(action))
 
-    def compute_chamfer_distance(self, recon_vertices, recon_faces, n_samples=10000):
+    def compute_modified_chamfer_distance(self, recon_vertices, recon_faces, n_samples=10000):
         """
         Compute the Chamfer distance between the reconstructed mesh and the ground truth mesh.
 
@@ -392,11 +402,11 @@ class Reconstruct3D(ManipulationEnv):
         from scipy.spatial import cKDTree
 
         # Check if ground truth mesh has been computed
-        if self.static_env_vertices is None or self.static_env_faces is None:
+        if self.gt_vertices is None or self.gt_faces is None:
             raise RuntimeError("Ground truth mesh has not been computed yet. Call compute_static_env_mesh() first.")
 
         # Sample points from both mesh surfaces
-        gt_points = self._sample_points_from_mesh(self.static_env_vertices, self.static_env_faces, n_samples)
+        gt_points = self._sample_points_from_mesh(self.gt_vertices, self.gt_faces, n_samples)
         recon_points = self._sample_points_from_mesh(recon_vertices, recon_faces, n_samples)
 
         # Build KD-trees for efficient nearest neighbor queries
@@ -421,7 +431,7 @@ class Reconstruct3D(ManipulationEnv):
 
     def _sample_points_from_mesh(self, vertices, faces, n_samples):
         """
-        Sample points uniformly from the surface of a triangle mesh.
+        Sample points uniformly (area-weighted) from a triangle mesh surface via trimesh.
 
         Args:
             vertices (np.ndarray): Mesh vertices, shape (N, 3)
@@ -431,58 +441,29 @@ class Reconstruct3D(ManipulationEnv):
         Returns:
             np.ndarray: Sampled points, shape (n_samples, 3)
         """
+        import trimesh
+
         if len(faces) == 0 or len(vertices) == 0:
             return np.zeros((n_samples, 3))
 
-        # Get triangle vertices
-        v0 = vertices[faces[:, 0]]
-        v1 = vertices[faces[:, 1]]
-        v2 = vertices[faces[:, 2]]
-
-        # Compute triangle areas for weighted sampling
-        cross = np.cross(v1 - v0, v2 - v0)
-        areas = 0.5 * np.linalg.norm(cross, axis=1)
-        total_area = areas.sum()
-
-        if total_area == 0:
+        mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+        if mesh.area == 0:
             return np.zeros((n_samples, 3))
 
-        # Normalize to get probabilities
-        probs = areas / total_area
+        points, _ = trimesh.sample.sample_surface(mesh, n_samples)
+        return np.asarray(points)
 
-        # Sample triangle indices weighted by area
-        rng = np.random.default_rng()
-        triangle_indices = rng.choice(len(faces), size=n_samples, p=probs)
-
-        # Sample random barycentric coordinates
-        r1 = rng.random(n_samples)
-        r2 = rng.random(n_samples)
-
-        # Ensure points are inside triangles (not in the "mirrored" region)
-        sqrt_r1 = np.sqrt(r1)
-        u = 1 - sqrt_r1
-        v = sqrt_r1 * (1 - r2)
-        w = sqrt_r1 * r2
-
-        # Compute sampled points using barycentric coordinates
-        sampled_v0 = vertices[faces[triangle_indices, 0]]
-        sampled_v1 = vertices[faces[triangle_indices, 1]]
-        sampled_v2 = vertices[faces[triangle_indices, 2]]
-
-        points = u[:, np.newaxis] * sampled_v0 + v[:, np.newaxis] * sampled_v1 + w[:, np.newaxis] * sampled_v2
-
-        return points
-
-    def compute_point_cloud_coverage_error(self, recon_points, coverage_distance=0.01, n_samples=10000):
+    def compute_point_cloud_coverage_error(self, recon_points, coverage_distance=0.01, n_samples=50000):
         """
         Fraction of ground-truth surface points not yet covered by the reconstruction.
 
         A GT surface point is "covered" if the reconstructed point cloud has a point
-        within ``coverage_distance`` of it. Error is the fraction of uncovered GT
-        points (1.0 = nothing covered, 0.0 = fully covered).
+        within ``coverage_distance`` of it. Error is the fraction of uncovered GT points
+        (1.0 = nothing covered, 0.0 = fully covered).
 
         Args:
-            recon_points (np.ndarray): Reconstructed point cloud, shape (N, 3).
+            recon_points (np.ndarray): Reconstructed point cloud, shape (N, 3). Assumed
+                append-only across steps within an episode, if it shrinks an error will be raised.
             coverage_distance (float): Neighborhood radius in meters.
             n_samples (int): Number of GT surface points to sample (cached per episode).
 
@@ -491,23 +472,44 @@ class Reconstruct3D(ManipulationEnv):
         """
         from scipy.spatial import cKDTree
 
-        if self.static_env_vertices is None or self.static_env_faces is None:
-            raise RuntimeError("Ground truth mesh has not been computed yet. Call compute_static_env_mesh() first.")
 
         # Sample and cache the GT surface point cloud once per episode
         if self.gt_surface_points is None:
+            if self.gt_vertices is None or self.gt_faces is None:
+                raise RuntimeError("Ground truth mesh has not been computed yet. Call compute_static_env_mesh() first.")
+
             self.gt_surface_points = self._sample_points_from_mesh(
-                self.static_env_vertices, self.static_env_faces, n_samples
+                self.gt_vertices, self.gt_faces, n_samples, visible_only=True
             )
+            self.gt_covered = np.zeros(len(self.gt_surface_points), dtype=bool)
+            self.gt_tree = cKDTree(self.gt_surface_points)
+            self.n_recon_consumed = 0
 
         gt = self.gt_surface_points
-        if recon_points is None or len(recon_points) == 0:
-            return 1.0, {"n_covered": 0, "n_gt": len(gt)}
+        n_recon_points = len(recon_points)
 
-        dist, _ = cKDTree(recon_points).query(gt, k=1)
-        covered = dist < coverage_distance
-        error = float(np.mean(~covered))
-        info = {"n_covered": int(covered.sum()), "n_gt": len(gt)}
+        # Cloud shrank => not append-only (e.g. a different policy) => must not happen
+        if n_recon_points < self.n_recon_consumed:
+            raise RuntimeError("Number of reconstruction points decreased within an episode. Must not happen due to caching mechanism.")
+
+        new_points = recon_points[self.n_recon_consumed :] if n_recon_points else []
+        self.n_recon_consumed = n_recon_points
+
+        if len(new_points) > 0:
+            # GT points within coverage_distance of any newly added reconstruction point
+            neighbors = self.gt_tree.query_ball_point(
+                new_points, r=coverage_distance, workers=-1, return_sorted=False
+            )
+            hits = np.concatenate(neighbors) if len(neighbors) > 0 else []
+            if len(hits) > 0:
+                self.gt_covered[hits.astype(np.intp)] = True
+
+        error = float(np.mean(~self.gt_covered))
+        info = {
+            "n_covered": int(self.gt_covered.sum()),
+            "n_gt": len(gt),
+            "n_recon_points": int(n_recon_points),
+        }
         return error, info
 
     def compute_voxelwise_tsdf_error(
@@ -746,17 +748,17 @@ class Reconstruct3D(ManipulationEnv):
             vertex_offset += len(vertices)
 
         # Combine all meshes
-        self.static_env_vertices = np.vstack(all_vertices) if all_vertices else np.zeros((0, 3))
-        self.static_env_faces = np.vstack(all_faces) if all_faces else np.zeros((0, 3), dtype=np.int32)
+        self.gt_vertices = np.vstack(all_vertices) if all_vertices else np.zeros((0, 3))
+        self.gt_faces = np.vstack(all_faces) if all_faces else np.zeros((0, 3), dtype=np.int32)
 
         # Compute bounding box
-        bbox_min = self.static_env_vertices.min(axis=0)
-        bbox_max = self.static_env_vertices.max(axis=0)
+        bbox_min = self.gt_vertices.min(axis=0)
+        bbox_max = self.gt_vertices.max(axis=0)
         self.bbox_center = (bbox_min + bbox_max) / 2
         # Add padding to bounding box to avoid cutting off surfaces at boundaries
         self.bbox_size = (bbox_max - bbox_min).max() * (1 + 2 * self.bbox_padding)
 
-        return self.static_env_vertices, self.static_env_faces
+        return self.gt_vertices, self.gt_faces
 
     def _load_model(self):
         """
@@ -886,6 +888,9 @@ class Reconstruct3D(ManipulationEnv):
         super()._reset_internal()
         self.cached_error = None
         self.gt_surface_points = None
+        self.gt_covered = None
+        self.gt_tree = None
+        self.n_recon_consumed = 0
 
         # Reset all object positions using initializer sampler if we're not directly loading from an xml
         if not self.deterministic_reset:
