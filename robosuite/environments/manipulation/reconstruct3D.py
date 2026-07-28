@@ -199,6 +199,7 @@ class Reconstruct3D(ManipulationEnv):
         # static env mesh related variables (initialized to None, computed via compute_static_env_mesh)
         self.static_env_vertices = None
         self.static_env_faces = None
+        self.gt_surface_points = None  # GT surface point cloud (for point_cloud_coverage)
         self.bbox_padding = bbox_padding
         self.bbox_center = None
         self.bbox_size = None
@@ -251,6 +252,7 @@ class Reconstruct3D(ManipulationEnv):
         reward_scale=1.0,
         characteristic_error=1.0,
         action_penalty_scale=0.0,
+        coverage_distance=0.01,
         output_info_dict=False,
     ):
         """
@@ -306,6 +308,13 @@ class Reconstruct3D(ManipulationEnv):
             info_dict.update(components)
             info_dict["voxelwise_tsdf_error"] = error
 
+        elif reconstruction_metric == "point_cloud_coverage":
+            error, components = self.compute_point_cloud_coverage_error(
+                recon_points=reconstruction, coverage_distance=coverage_distance
+            )
+            info_dict.update(components)
+            info_dict["point_cloud_coverage_error"] = error
+
         else:
             raise ValueError(f"Unknown reconstruction_metric: '{reconstruction_metric}'. ")
 
@@ -322,6 +331,8 @@ class Reconstruct3D(ManipulationEnv):
                     self.cached_error = error  # No reward at first step
                 if reconstruction_metric == "voxelwise_tsdf_error":
                     self.cached_error = 1.0  # 1.0 as default error, corresponds to all missing but no distance error
+                if reconstruction_metric == "point_cloud_coverage":
+                    self.cached_error = 1.0  # 1.0 = nothing covered yet
 
             reward = reward_scale * (self.cached_error - error) / characteristic_error
         else:
@@ -461,6 +472,43 @@ class Reconstruct3D(ManipulationEnv):
         points = u[:, np.newaxis] * sampled_v0 + v[:, np.newaxis] * sampled_v1 + w[:, np.newaxis] * sampled_v2
 
         return points
+
+    def compute_point_cloud_coverage_error(self, recon_points, coverage_distance=0.01, n_samples=10000):
+        """
+        Fraction of ground-truth surface points not yet covered by the reconstruction.
+
+        A GT surface point is "covered" if the reconstructed point cloud has a point
+        within ``coverage_distance`` of it. Error is the fraction of uncovered GT
+        points (1.0 = nothing covered, 0.0 = fully covered).
+
+        Args:
+            recon_points (np.ndarray): Reconstructed point cloud, shape (N, 3).
+            coverage_distance (float): Neighborhood radius in meters.
+            n_samples (int): Number of GT surface points to sample (cached per episode).
+
+        Returns:
+            tuple: (error, info_dict)
+        """
+        from scipy.spatial import cKDTree
+
+        if self.static_env_vertices is None or self.static_env_faces is None:
+            raise RuntimeError("Ground truth mesh has not been computed yet. Call compute_static_env_mesh() first.")
+
+        # Sample and cache the GT surface point cloud once per episode
+        if self.gt_surface_points is None:
+            self.gt_surface_points = self._sample_points_from_mesh(
+                self.static_env_vertices, self.static_env_faces, n_samples
+            )
+
+        gt = self.gt_surface_points
+        if recon_points is None or len(recon_points) == 0:
+            return 1.0, {"n_covered": 0, "n_gt": len(gt)}
+
+        dist, _ = cKDTree(recon_points).query(gt, k=1)
+        covered = dist < coverage_distance
+        error = float(np.mean(~covered))
+        info = {"n_covered": int(covered.sum()), "n_gt": len(gt)}
+        return error, info
 
     def compute_voxelwise_tsdf_error(
         self,
@@ -837,6 +885,7 @@ class Reconstruct3D(ManipulationEnv):
         """
         super()._reset_internal()
         self.cached_error = None
+        self.gt_surface_points = None
 
         # Reset all object positions using initializer sampler if we're not directly loading from an xml
         if not self.deterministic_reset:
